@@ -278,7 +278,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Paragraph::new(vec![
             Line::styled(status_text, style),
             Line::raw(
-                "Ctrl-A/Tab:main R:refresh h/l:team j/k:item g:top D:reset-cmd M:read E/x:export",
+                "Ctrl-A/Tab:main R:refresh j/k:item D:cmd B:bulk-reset W:bulk-rename M:read E:export",
             ),
         ]),
         area,

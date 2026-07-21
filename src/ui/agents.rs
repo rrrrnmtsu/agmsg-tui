@@ -62,7 +62,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     );
     frame.render_widget(
         Paragraph::new(
-            "n:new t/Tab:focus R:rename T:team X/Del:reset L:leave Enter:info(identity) r:reload ?:help A/q:back",
+            "n:new t/Tab:focus R:rename T:team X:reset D:despawn L:leave Enter:info r:reload ?:help A:back",
         )
         .style(Style::default().fg(Color::DarkGray)),
         rows[2],

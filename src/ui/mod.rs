@@ -1,5 +1,7 @@
 mod audit;
 mod agents;
+mod bulk_filter;
+mod bulk_preview;
 mod composer;
 mod health;
 mod main_screen;
@@ -139,6 +141,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Screen::Audit => audit::render(frame, app),
         Screen::Agents => agents::render(frame, app),
         Screen::Health => health::render(frame, app),
+        Screen::BulkFilter => bulk_filter::render(frame, app),
         Screen::Composer => {
             main_screen::render(frame, app);
             composer::render(frame, app);
@@ -147,6 +150,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             match app.help_return_screen {
                 Screen::Agents => agents::render(frame, app),
                 Screen::Health => health::render(frame, app),
+                Screen::BulkFilter => bulk_filter::render(frame, app),
                 _ => main_screen::render(frame, app),
             }
             main_screen::render_help(frame, app);
@@ -157,6 +161,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             notification_settings::render(frame, app);
         }
     }
+    bulk_preview::render(frame, app);
     // Single choke point for every screen (S10-1/S10-2): applied after all
     // widgets have drawn, so it sees the final color every cell actually
     // ended up with instead of needing to intercept each `Style` at the ~90
@@ -180,6 +185,9 @@ mod tests {
 
     use super::render;
     use crate::app::{App, AppAction, Screen};
+    use crate::bulk::{
+        BulkKind, BulkModal, BulkOperation, BulkTarget, MarkReadTarget, ResetTarget,
+    };
     use crate::config::Paths;
     use crate::db::{AgentTraffic, DailyTraffic};
     use crate::exec::CommandResult;
@@ -725,5 +733,105 @@ mod tests {
         }
         assert!(!snapshot.contains("LAST MSG"));
         assert!(!snapshot.contains("TRAFFIC"));
+    }
+
+    #[test]
+    fn bulk_filter_and_mark_preview_fit_at_80_by_24() {
+        let (_temp, mut app) = agents_fixture();
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .expect("open bulk filter");
+        assert_eq!(app.screen, Screen::BulkFilter);
+        app.bulk_modal = Some(BulkModal::Preview {
+            kind: BulkKind::MarkRead,
+            targets: vec![BulkTarget::MarkRead(MarkReadTarget {
+                team: "ops-hub".to_owned(),
+                recipient: "codex-worker".to_owned(),
+                message_count: 1,
+            })],
+            confirm: "YE".to_owned(),
+            scroll: 0,
+        });
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("draw preview");
+        let snapshot = terminal.backend().to_string();
+        for needle in ["BULK FILTER", "bulk mark read preview", "inbox.sh", "Type YES: YE"] {
+            assert!(snapshot.contains(needle), "bulk preview missing {needle}");
+        }
+    }
+
+    #[test]
+    fn bulk_filter_narrow_layout_renders_without_panicking() {
+        let (_temp, mut app) = agents_fixture();
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .expect("open bulk filter");
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("draw narrow bulk filter");
+        let snapshot = terminal.backend().to_string();
+        assert!(snapshot.contains("BULK FILTER"));
+        assert!(snapshot.contains("RESULTS"));
+    }
+
+    #[test]
+    fn reset_preview_expands_resolve_project_command_at_80_by_24() {
+        let (_temp, mut app) = agents_fixture();
+        app.screen = Screen::Audit;
+        app.bulk_modal = Some(BulkModal::Preview {
+            kind: BulkKind::Reset,
+            targets: vec![BulkTarget::Reset(ResetTarget {
+                team: "ops-hub".to_owned(),
+                agent: "codex-worker".to_owned(),
+                agent_type: "codex".to_owned(),
+                project: "/Users/remma/dev/ops-hub".to_owned(),
+            })],
+            confirm: String::new(),
+            scroll: 0,
+        });
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("draw reset preview");
+        let snapshot = terminal.backend().to_string();
+        assert!(snapshot.contains("bulk reset preview"));
+        assert!(snapshot.contains("AGMSG_RESOLVE_PROJECT=0"));
+        assert!(snapshot.contains("codex-worker"));
+    }
+
+    #[test]
+    fn bulk_progress_renders_completed_over_total_and_results() {
+        let (_temp, mut app) = agents_fixture();
+        app.screen = Screen::BulkFilter;
+        let targets = vec![
+            BulkTarget::MarkRead(MarkReadTarget {
+                team: "ops-hub".to_owned(),
+                recipient: "codex-worker".to_owned(),
+                message_count: 2,
+            }),
+            BulkTarget::MarkRead(MarkReadTarget {
+                team: "sakura-project".to_owned(),
+                recipient: "opencode-review".to_owned(),
+                message_count: 1,
+            }),
+        ];
+        let mut operation = BulkOperation::new(BulkKind::MarkRead, targets.clone());
+        operation.record_success(
+            targets[0].clone(),
+            &CommandResult {
+                success: true,
+                exit_code: Some(0),
+                stdout: "2 new message(s)".to_owned(),
+                stderr: String::new(),
+            },
+        );
+        app.bulk_operation = Some(operation);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("draw progress");
+        let snapshot = terminal.backend().to_string();
+        assert!(snapshot.contains("2/3 complete"));
+        assert!(snapshot.contains("✓ ops-hub/codex-worker"));
+        assert!(snapshot.contains("running: sakura-project/opencode-review"));
     }
 }

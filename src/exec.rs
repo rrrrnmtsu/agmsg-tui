@@ -4,9 +4,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
+use tokio::sync::watch;
 use tokio::time::timeout;
 
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(10);
+const DESPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandResult {
@@ -121,6 +123,24 @@ impl ScriptRunner {
         .await
     }
 
+    pub async fn mark_recipient_read_cancellable(
+        &self,
+        team: &str,
+        recipient: &str,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<CommandResult> {
+        self.run_cancellable(
+            "inbox.sh",
+            [
+                OsStr::new(team),
+                OsStr::new(recipient),
+                OsStr::new("--quiet"),
+            ],
+            cancel,
+        )
+        .await
+    }
+
     pub async fn mark_team_read(&self, team: &str, recipients: &[String]) -> Result<CommandResult> {
         let mut combined_stdout = String::new();
         let mut combined_stderr = String::new();
@@ -211,6 +231,21 @@ impl ScriptRunner {
         .await
     }
 
+    pub async fn rename_cancellable(
+        &self,
+        team: &str,
+        old: &str,
+        new: &str,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<CommandResult> {
+        self.run_cancellable(
+            "rename.sh",
+            [OsStr::new(team), OsStr::new(old), OsStr::new(new)],
+            cancel,
+        )
+        .await
+    }
+
     pub async fn rename_team(&self, old: &str, new: &str) -> Result<CommandResult> {
         self.run(
             "rename-team.sh",
@@ -235,12 +270,73 @@ impl ScriptRunner {
         .await
     }
 
+    pub async fn reset_cancellable(
+        &self,
+        project: &str,
+        agent_type: &str,
+        agent: &str,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<CommandResult> {
+        let args = reset_arguments(project, agent_type, agent);
+        self.run_with_env_cancellable(
+            "reset.sh",
+            &[("AGMSG_RESOLVE_PROJECT", "0")],
+            args.iter(),
+            cancel,
+        )
+        .await
+    }
+
     pub async fn leave(&self, team: &str, agent: &str) -> Result<CommandResult> {
         self.run(
             "leave.sh",
             [OsStr::new(team), OsStr::new(agent)],
         )
         .await
+    }
+
+    /// `despawn.sh` is the sole Phase 12 exception to the normal 10 second
+    /// subprocess budget: graceful teardown intentionally waits for the
+    /// remote watcher to release its actas lock.
+    pub async fn despawn(
+        &self,
+        team: &str,
+        from: &str,
+        name: &str,
+        force: bool,
+    ) -> Result<CommandResult> {
+        let mut runner = self.clone();
+        runner.timeout = DESPAWN_TIMEOUT;
+        let mut args = vec![
+            OsString::from(team),
+            OsString::from(from),
+            OsString::from(name),
+        ];
+        if force {
+            args.push(OsString::from("--force"));
+        }
+        runner.run("despawn.sh", args).await
+    }
+
+    pub async fn despawn_cancellable(
+        &self,
+        team: &str,
+        from: &str,
+        name: &str,
+        force: bool,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<CommandResult> {
+        let mut runner = self.clone();
+        runner.timeout = DESPAWN_TIMEOUT;
+        let mut args = vec![
+            OsString::from(team),
+            OsString::from(from),
+            OsString::from(name),
+        ];
+        if force {
+            args.push(OsString::from("--force"));
+        }
+        runner.run_cancellable("despawn.sh", args, cancel).await
     }
 
     async fn run<I, S>(&self, script: &str, args: I) -> Result<CommandResult>
@@ -264,6 +360,36 @@ impl ScriptRunner {
     {
         let script_path = self.scripts_dir.join(script);
         self.run_path_with_env(&script_path, envs, args).await
+    }
+
+    async fn run_cancellable<I, S>(
+        &self,
+        script: &str,
+        args: I,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<CommandResult>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_with_env_cancellable(script, &[], args, cancel)
+            .await
+    }
+
+    async fn run_with_env_cancellable<I, S>(
+        &self,
+        script: &str,
+        envs: &[(&str, &str)],
+        args: I,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<CommandResult>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let script_path = self.scripts_dir.join(script);
+        self.run_path_with_env_cancellable(&script_path, envs, args, cancel)
+            .await
     }
 
     async fn run_path<I, S>(&self, script_path: &Path, args: I) -> Result<CommandResult>
@@ -307,6 +433,44 @@ impl ScriptRunner {
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         })
     }
+
+    async fn run_path_with_env_cancellable<I, S>(
+        &self,
+        script_path: &Path,
+        envs: &[(&str, &str)],
+        args: I,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<CommandResult>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        ensure_script_exists(script_path)?;
+        let mut command = Command::new("bash");
+        command.arg(script_path).args(args).kill_on_drop(true);
+        command.envs(envs.iter().copied());
+        let script = script_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("script");
+        let output = tokio::select! {
+            biased;
+            changed = cancel.changed() => {
+                changed.context("bulk cancel channel closed")?;
+                bail!("cancelled: {script}");
+            }
+            output = timeout(self.timeout, command.output()) => match output {
+                Ok(output) => output.with_context(|| format!("{} を実行できません", script_path.display()))?,
+                Err(_) => bail!("timeout: {script} ({})", timeout_label(self.timeout)),
+            },
+        };
+        Ok(CommandResult {
+            success: output.status.success(),
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
+    }
 }
 
 fn timeout_label(duration: Duration) -> String {
@@ -334,6 +498,28 @@ pub fn reset_command_display(
         shell_quote(&script.to_string_lossy()),
         args.iter()
             .map(|argument| shell_quote(argument))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+pub fn despawn_command_display(
+    scripts_dir: &Path,
+    team: &str,
+    from: &str,
+    name: &str,
+    force: bool,
+) -> String {
+    let script = scripts_dir.join("despawn.sh");
+    let mut args = vec![team, from, name];
+    if force {
+        args.push("--force");
+    }
+    format!(
+        "{} {}",
+        shell_quote(&script.to_string_lossy()),
+        args.into_iter()
+            .map(shell_quote)
             .collect::<Vec<_>>()
             .join(" ")
     )
@@ -430,6 +616,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn despawn_preserves_argument_order_and_adds_force_only_when_requested() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let scripts = temp.path().join("scripts");
+        fs::create_dir_all(&scripts).expect("scripts dir");
+        fs::write(
+            scripts.join("despawn.sh"),
+            "#!/bin/bash\nprintf '<%s>\\n' \"$@\"\n",
+        )
+        .expect("despawn script");
+        let runner = ScriptRunner::new(&scripts, temp.path().join("agmsg-audit"));
+        let graceful = runner
+            .despawn("ops-hub", "claude-main", "codex-worker", false)
+            .await
+            .expect("graceful");
+        assert_eq!(
+            graceful.stdout,
+            "<ops-hub>\n<claude-main>\n<codex-worker>"
+        );
+        let force = runner
+            .despawn("ops-hub", "claude-main", "codex-worker", true)
+            .await
+            .expect("force");
+        assert!(force.stdout.ends_with("<--force>"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn script_timeout_returns_exact_error_without_waiting_for_child() {
         let temp = tempfile::tempdir().expect("tempdir");
         let scripts = temp.path().join("scripts");
@@ -443,6 +655,23 @@ mod tests {
             .await
             .expect_err("timeout");
         assert_eq!(error.to_string(), "timeout: send.sh (20ms)");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bulk_cancel_channel_stops_running_script() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let scripts = temp.path().join("scripts");
+        fs::create_dir_all(&scripts).expect("scripts dir");
+        fs::write(scripts.join("inbox.sh"), "#!/bin/bash\nsleep 5\n")
+            .expect("inbox script");
+        let runner = ScriptRunner::new(&scripts, temp.path().join("agmsg-audit"));
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        let started = Instant::now();
+        let pending = runner.mark_recipient_read_cancellable("ops", "codex", receiver);
+        cancel.send(true).expect("cancel");
+        let error = pending.await.expect_err("cancelled");
+        assert_eq!(error.to_string(), "cancelled: inbox.sh");
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

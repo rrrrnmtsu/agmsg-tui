@@ -648,6 +648,20 @@ impl Database {
         Ok(usize::try_from(count).unwrap_or_default())
     }
 
+    /// Phase 12 bulk filter source. The connection remains READ_ONLY and the
+    /// complete message set is loaded once when the separate filter screen is
+    /// opened; subsequent edits only recompute over this in-memory vector.
+    pub fn all_messages(&self) -> Result<Vec<Message>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT id, team, from_agent, to_agent, body, created_at, read_at
+             FROM messages ORDER BY created_at DESC, id DESC",
+        )?;
+        Ok(statement
+            .query_map([], map_message)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn message_by_id(&self, id: i64) -> Result<Option<Message>> {
         let connection = self.connect()?;
         Ok(connection

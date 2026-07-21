@@ -1,6 +1,7 @@
 pub mod app;
 pub mod agents;
 pub mod audit;
+pub mod bulk;
 pub mod clipboard;
 pub mod color;
 pub mod config;

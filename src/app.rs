@@ -9,12 +9,18 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::agents::{
     AgentFocus, AgentModal, AgentOperation, CLI_TYPES, SpawnModalState, SpawnStep,
     validate_agent_name, validate_team_name,
 };
 use crate::audit::{AuditReport, build_markdown, parse_audit_stdout, report_stamp};
+use crate::bulk::{
+    BulkFilterFocus, BulkFilterState, BulkKind, BulkModal, BulkOperation, BulkRunState, BulkTarget,
+    DespawnTarget, ExportFormat, LockStatus, RenameTarget, ResetTarget, actas_lock_status,
+    export_bulk_messages, mark_read_targets, naming_violations,
+};
 use crate::config::Paths;
 use crate::db::{
     ANALYTICS_WINDOW_DAYS, AgentIdentitySummary, AgentTeamSummary, Database, MemberSummary,
@@ -56,6 +62,7 @@ pub enum Screen {
     Audit,
     Agents,
     Health,
+    BulkFilter,
     Help,
 }
 
@@ -179,6 +186,11 @@ pub enum AppAction {
     RefreshAudit,
     RefreshHealth,
     ExportReport,
+    ExportBulk(ExportFormat),
+    RunBulk {
+        target: BulkTarget,
+        force_despawn: bool,
+    },
     Yank(String),
     ManageAgent(AgentOperation),
 }
@@ -188,6 +200,7 @@ pub enum InFlightOperation {
     Send,
     MarkRead,
     Agent,
+    Bulk,
 }
 
 impl InFlightOperation {
@@ -196,6 +209,7 @@ impl InFlightOperation {
             Self::Send => "sending",
             Self::MarkRead => "marking read",
             Self::Agent => "running agent op",
+            Self::Bulk => "running bulk op",
         }
     }
 }
@@ -241,6 +255,10 @@ pub struct App {
     pub health_loading: bool,
     pub health_window_days: u32,
     pub health_team_index: usize,
+    pub bulk_filter: Option<BulkFilterState>,
+    pub bulk_modal: Option<BulkModal>,
+    pub bulk_operation: Option<BulkOperation>,
+    bulk_cancel: Option<watch::Sender<bool>>,
     /// Sidebar width as a percentage, drag-resizable (`ui::SIDEBAR_MIN_PCT`..=`ui::SIDEBAR_MAX_PCT`).
     pub sidebar_pct: u16,
     /// True while a left-button drag started on the resize handle is still held.
@@ -345,6 +363,10 @@ impl App {
             health_loading: false,
             health_window_days: 7,
             health_team_index: 0,
+            bulk_filter: None,
+            bulk_modal: None,
+            bulk_operation: None,
+            bulk_cancel: None,
             sidebar_pct: persisted
                 .sidebar_pct
                 .clamp(SIDEBAR_MIN_PCT, SIDEBAR_MAX_PCT),
@@ -584,6 +606,7 @@ impl App {
             Screen::Audit => self.handle_audit_key(key),
             Screen::Agents => self.handle_agents_key(key),
             Screen::Health => self.handle_health_key(key),
+            Screen::BulkFilter => self.handle_bulk_filter_key(key),
             Screen::Main => self.handle_main_key(key),
         };
         if self.persistence_snapshot() != before {
@@ -999,6 +1022,10 @@ impl App {
         if self.input_mode == InputMode::Search {
             return self.handle_search_key(key);
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+            self.open_bulk_filter()?;
+            return Ok(AppAction::None);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
             return self.open_audit();
         }
@@ -1208,6 +1235,9 @@ impl App {
     }
 
     fn handle_agents_key(&mut self, key: KeyEvent) -> Result<AppAction> {
+        if let Some(action) = self.handle_bulk_overlay_key(key)? {
+            return Ok(action);
+        }
         // M-1: agent management scripts now run off the render thread
         // (`InFlightOperation::Agent`), same shape as Send. While one is in
         // flight we swallow input here too — same as `handle_composer_key`
@@ -1337,6 +1367,7 @@ impl App {
                     });
                 }
             }
+            KeyCode::Char('D') => self.open_despawn_preview(),
             KeyCode::Char('L') if self.agent_focus == AgentFocus::Teams => {
                 self.open_leave_modal_from_team_focus();
             }
@@ -1954,6 +1985,9 @@ impl App {
     }
 
     fn handle_audit_key(&mut self, key: KeyEvent) -> Result<AppAction> {
+        if let Some(action) = self.handle_bulk_overlay_key(key)? {
+            return Ok(action);
+        }
         if self.audit_detail.is_some()
             && matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q'))
         {
@@ -1999,6 +2033,8 @@ impl App {
             // M-2: jump to the top of the currently selected list.
             KeyCode::Char('g') => self.audit_selected = 0,
             KeyCode::Char('D') => self.show_reset_command(),
+            KeyCode::Char('B') => self.open_bulk_reset_preview(),
+            KeyCode::Char('W') => self.open_bulk_rename_wizard(),
             KeyCode::Char('M') => return self.mark_stale_action(),
             KeyCode::Enter => self.show_audit_detail(),
             _ => {}
@@ -2052,6 +2088,660 @@ impl App {
         } else {
             Ok(AppAction::None)
         }
+    }
+
+    fn open_bulk_filter(&mut self) -> Result<()> {
+        let messages = self.database.all_messages()?;
+        self.bulk_filter = Some(BulkFilterState::new(messages, chrono::Utc::now()));
+        self.bulk_modal = None;
+        self.bulk_operation = None;
+        self.bulk_cancel = None;
+        self.screen = Screen::BulkFilter;
+        self.status = StatusLine {
+            text: "bulk filter loaded".to_owned(),
+            is_error: false,
+        };
+        Ok(())
+    }
+
+    fn handle_bulk_filter_key(&mut self, key: KeyEvent) -> Result<AppAction> {
+        if let Some(action) = self.handle_bulk_overlay_key(key)? {
+            return Ok(action);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+            self.screen = Screen::Main;
+            return Ok(AppAction::None);
+        }
+        let Some(filter) = self.bulk_filter.as_mut() else {
+            self.open_bulk_filter()?;
+            return Ok(AppAction::None);
+        };
+        let mut recompute = false;
+        match key.code {
+            KeyCode::Esc => self.screen = Screen::Main,
+            KeyCode::Char('q') if filter.focus == BulkFilterFocus::Results => {
+                return Ok(AppAction::Quit);
+            }
+            KeyCode::Tab => filter.focus = filter.focus.next(false),
+            KeyCode::BackTab => filter.focus = filter.focus.next(true),
+            KeyCode::Char('j') | KeyCode::Down if filter.focus == BulkFilterFocus::Results => {
+                filter.selected =
+                    (filter.selected + 1).min(filter.results.len().saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up if filter.focus == BulkFilterFocus::Results => {
+                filter.selected = filter.selected.saturating_sub(1);
+            }
+            KeyCode::Char('g') if filter.focus == BulkFilterFocus::Results => {
+                filter.selected = 0;
+            }
+            KeyCode::Char('G') if filter.focus == BulkFilterFocus::Results => {
+                filter.selected = filter.results.len().saturating_sub(1);
+            }
+            KeyCode::Left if filter.focus == BulkFilterFocus::Period => {
+                filter.period = filter.period.cycle(-1);
+                recompute = true;
+            }
+            KeyCode::Right | KeyCode::Char(' ') if filter.focus == BulkFilterFocus::Period => {
+                filter.period = filter.period.cycle(1);
+                recompute = true;
+            }
+            KeyCode::Char('7') if filter.focus == BulkFilterFocus::Period => {
+                filter.period = crate::bulk::FilterPeriod::SevenDays;
+                recompute = true;
+            }
+            KeyCode::Char('3') if filter.focus == BulkFilterFocus::Period => {
+                filter.period = crate::bulk::FilterPeriod::ThirtyDays;
+                recompute = true;
+            }
+            KeyCode::Char('a') if filter.focus == BulkFilterFocus::Period => {
+                filter.period = crate::bulk::FilterPeriod::All;
+                recompute = true;
+            }
+            KeyCode::Backspace if filter.focus == BulkFilterFocus::Agent => {
+                filter.agent.pop();
+                recompute = true;
+            }
+            KeyCode::Backspace if filter.focus == BulkFilterFocus::Body => {
+                filter.body.pop();
+                recompute = true;
+            }
+            KeyCode::Char(character)
+                if filter.focus == BulkFilterFocus::Agent
+                    && plain_text_key(key)
+                    && !matches!(character, 'M' | 'E' | '?') =>
+            {
+                filter.agent.push(character);
+                recompute = true;
+            }
+            KeyCode::Char(character)
+                if filter.focus == BulkFilterFocus::Body
+                    && plain_text_key(key)
+                    && !matches!(character, 'M' | 'E' | '?') =>
+            {
+                filter.body.push(character);
+                recompute = true;
+            }
+            KeyCode::Char('M') => {
+                let targets = mark_read_targets(filter.messages().cloned());
+                if targets.is_empty() {
+                    self.status = StatusLine {
+                        text: "filter has no unread messages".to_owned(),
+                        is_error: false,
+                    };
+                } else {
+                    self.bulk_modal = Some(BulkModal::Preview {
+                        kind: BulkKind::MarkRead,
+                        targets,
+                        confirm: String::new(),
+                        scroll: 0,
+                    });
+                }
+            }
+            KeyCode::Char('E') => {
+                if filter.results.is_empty() {
+                    self.status = validation_status("filter has no results".to_owned());
+                } else {
+                    self.bulk_modal = Some(BulkModal::ExportFormat {
+                        selected: ExportFormat::Markdown,
+                    });
+                }
+            }
+            KeyCode::Char('?') => {
+                self.help_return_screen = Screen::BulkFilter;
+                self.help_scroll = 0;
+                self.screen = Screen::Help;
+            }
+            _ => {}
+        }
+        if recompute {
+            filter.recompute(chrono::Utc::now());
+        }
+        Ok(AppAction::None)
+    }
+
+    fn handle_bulk_overlay_key(&mut self, key: KeyEvent) -> Result<Option<AppAction>> {
+        if self.bulk_operation.is_some() {
+            return self.handle_bulk_operation_key(key).map(Some);
+        }
+        if self.bulk_modal.is_some() {
+            return self.handle_bulk_modal_key(key).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn handle_bulk_modal_key(&mut self, key: KeyEvent) -> Result<AppAction> {
+        let Some(mut modal) = self.bulk_modal.take() else {
+            return Ok(AppAction::None);
+        };
+        let mut keep_open = true;
+        let mut action = AppAction::None;
+        match &mut modal {
+            BulkModal::Preview {
+                kind,
+                targets,
+                confirm,
+                scroll,
+            } => match key.code {
+                KeyCode::Esc => keep_open = false,
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *scroll = (*scroll + 1).min(targets.len().saturating_sub(1));
+                }
+                KeyCode::Backspace => {
+                    confirm.pop();
+                }
+                KeyCode::Enter if confirm == "YES" => {
+                    let kind = *kind;
+                    let targets = targets.clone();
+                    keep_open = false;
+                    action = self.begin_bulk_operation(kind, targets)?;
+                }
+                KeyCode::Enter => {
+                    self.status = validation_status("type YES exactly".to_owned());
+                }
+                KeyCode::Char(character) if plain_text_key(key) => confirm.push(character),
+                _ => {}
+            },
+            BulkModal::ExportFormat { selected } => match key.code {
+                KeyCode::Esc => keep_open = false,
+                KeyCode::Left | KeyCode::Right => {
+                    *selected = match selected {
+                        ExportFormat::Markdown => ExportFormat::Json,
+                        ExportFormat::Json => ExportFormat::Markdown,
+                    };
+                }
+                KeyCode::Char('m') | KeyCode::Char('k') | KeyCode::Up => {
+                    *selected = ExportFormat::Markdown;
+                }
+                KeyCode::Char('j') | KeyCode::Down => *selected = ExportFormat::Json,
+                KeyCode::Enter => {
+                    action = AppAction::ExportBulk(*selected);
+                    keep_open = false;
+                }
+                _ => {}
+            },
+            BulkModal::RenameEdit {
+                targets,
+                selected,
+                editing,
+            } => match key.code {
+                KeyCode::Esc => keep_open = false,
+                KeyCode::Up => {
+                    *selected = selected.saturating_sub(1);
+                    *editing = false;
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    *selected = (*selected + 1).min(targets.len().saturating_sub(1));
+                    *editing = false;
+                }
+                KeyCode::BackTab => {
+                    *selected = selected.saturating_sub(1);
+                    *editing = false;
+                }
+                KeyCode::Backspace => {
+                    *editing = true;
+                    if let Some(target) = targets.get_mut(*selected) {
+                        target.new.pop();
+                    }
+                }
+                KeyCode::Enter => match self.validate_bulk_renames(targets) {
+                    Ok(()) => {
+                        self.bulk_modal = Some(BulkModal::RenameConfirm {
+                            targets: targets.clone(),
+                            confirm: String::new(),
+                            scroll: 0,
+                        });
+                        keep_open = false;
+                    }
+                    Err(error) => self.status = validation_status(error),
+                },
+                KeyCode::Char(character) if plain_text_key(key) => {
+                    if let Some(target) = targets.get_mut(*selected) {
+                        if !*editing {
+                            target.new.clear();
+                            *editing = true;
+                        }
+                        target.new.push(character);
+                    }
+                }
+                _ => {}
+            },
+            BulkModal::RenameConfirm {
+                targets,
+                confirm,
+                scroll,
+            } => match key.code {
+                KeyCode::Esc => keep_open = false,
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *scroll = (*scroll + 1).min(targets.len().saturating_sub(1));
+                }
+                KeyCode::Backspace => {
+                    confirm.pop();
+                }
+                KeyCode::Enter if confirm == "YES" => {
+                    let targets = targets
+                        .iter()
+                        .cloned()
+                        .map(BulkTarget::Rename)
+                        .collect();
+                    keep_open = false;
+                    action = self.begin_bulk_operation(BulkKind::Rename, targets)?;
+                }
+                KeyCode::Enter => self.status = validation_status("type YES exactly".to_owned()),
+                KeyCode::Char(character) if plain_text_key(key) => confirm.push(character),
+                _ => {}
+            },
+        }
+        if keep_open {
+            self.bulk_modal = Some(modal);
+        }
+        Ok(action)
+    }
+
+    fn handle_bulk_operation_key(&mut self, key: KeyEvent) -> Result<AppAction> {
+        let Some(state) = self
+            .bulk_operation
+            .as_ref()
+            .map(|operation| operation.state.clone())
+        else {
+            return Ok(AppAction::None);
+        };
+        match state {
+            BulkRunState::Running => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    if let Some(operation) = self.bulk_operation.as_mut() {
+                        operation.cancel_requested = true;
+                    }
+                    if let Some(cancel) = self.bulk_cancel.as_ref() {
+                        let _ = cancel.send(true);
+                    }
+                    self.status = StatusLine {
+                        text: "bulk abort requested; cancelling current command".to_owned(),
+                        is_error: false,
+                    };
+                }
+                Ok(AppAction::None)
+            }
+            BulkRunState::AwaitDecision { .. } => match key.code {
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    if let Some(operation) = self.bulk_operation.as_mut() {
+                        operation.skip_failed_and_continue();
+                    }
+                    self.next_bulk_action_or_finish(false)
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Esc => {
+                    if let Some(operation) = self.bulk_operation.as_mut() {
+                        operation.skip_failed_and_continue();
+                    }
+                    self.finish_bulk_operation(true)?;
+                    Ok(AppAction::None)
+                }
+                _ => Ok(AppAction::None),
+            },
+            BulkRunState::AwaitForce { .. } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('f') => {
+                    if let Some(operation) = self.bulk_operation.as_mut() {
+                        operation.retry_force();
+                    }
+                    Ok(self.current_bulk_action().unwrap_or(AppAction::None))
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    if let Some(operation) = self.bulk_operation.as_mut() {
+                        operation.skip_failed_and_continue();
+                    }
+                    self.finish_bulk_operation(true)?;
+                    Ok(AppAction::None)
+                }
+                _ => Ok(AppAction::None),
+            },
+            BulkRunState::Complete { .. } => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                        self.bulk_operation = None;
+                        self.bulk_cancel = None;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if let Some(operation) = self.bulk_operation.as_mut() {
+                            operation.results_cursor = (operation.results_cursor + 1)
+                                .min(operation.results.len().saturating_sub(1));
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if let Some(operation) = self.bulk_operation.as_mut() {
+                            operation.results_cursor = operation.results_cursor.saturating_sub(1);
+                        }
+                    }
+                    KeyCode::Char('g') => {
+                        if let Some(operation) = self.bulk_operation.as_mut() {
+                            operation.results_cursor = 0;
+                        }
+                    }
+                    KeyCode::Char('G') => {
+                        if let Some(operation) = self.bulk_operation.as_mut() {
+                            operation.results_cursor = operation.results.len().saturating_sub(1);
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(AppAction::None)
+            }
+        }
+    }
+
+    fn begin_bulk_operation(
+        &mut self,
+        kind: BulkKind,
+        targets: Vec<BulkTarget>,
+    ) -> Result<AppAction> {
+        anyhow::ensure!(!targets.is_empty(), "bulk target is empty");
+        if self.in_flight.is_some() {
+            self.update_spinner_status();
+            return Ok(AppAction::None);
+        }
+        let (cancel, _) = watch::channel(false);
+        self.bulk_cancel = Some(cancel);
+        self.bulk_operation = Some(BulkOperation::new(kind, targets));
+        Ok(self.current_bulk_action().unwrap_or(AppAction::None))
+    }
+
+    fn current_bulk_action(&self) -> Option<AppAction> {
+        let operation = self.bulk_operation.as_ref()?;
+        Some(AppAction::RunBulk {
+            target: operation.current_target()?.clone(),
+            force_despawn: operation.force_despawn,
+        })
+    }
+
+    pub fn bulk_cancel_receiver(&self) -> Option<watch::Receiver<bool>> {
+        self.bulk_cancel.as_ref().map(watch::Sender::subscribe)
+    }
+
+    fn next_bulk_action_or_finish(&mut self, aborted: bool) -> Result<AppAction> {
+        let has_next = self
+            .bulk_operation
+            .as_ref()
+            .is_some_and(|operation| operation.current_target().is_some());
+        if has_next && !aborted {
+            return Ok(self.current_bulk_action().unwrap_or(AppAction::None));
+        }
+        self.finish_bulk_operation(aborted)?;
+        Ok(AppAction::None)
+    }
+
+    pub fn complete_bulk_target(
+        &mut self,
+        target: BulkTarget,
+        result: Result<CommandResult, String>,
+    ) -> Result<AppAction> {
+        let cancel_requested = self
+            .bulk_operation
+            .as_ref()
+            .is_some_and(|operation| operation.cancel_requested);
+        let succeeded = result.as_ref().is_ok_and(|result| result.success);
+        if cancel_requested {
+            if succeeded {
+                let result = result.as_ref().expect("checked above");
+                if let Some(operation) = self.bulk_operation.as_mut() {
+                    operation.record_success(target, result);
+                }
+            } else if let Some(operation) = self.bulk_operation.as_mut() {
+                operation.record_cancelled(target);
+            }
+            self.finish_bulk_operation(true)?;
+            return Ok(AppAction::None);
+        }
+        if succeeded {
+            let result = result.as_ref().expect("checked above");
+            if let Some(operation) = self.bulk_operation.as_mut() {
+                operation.record_success(target, result);
+            }
+        } else {
+            let detail = match result {
+                Ok(result) => command_failure_detail(&result),
+                Err(error) => error,
+            };
+            if let Some(operation) = self.bulk_operation.as_mut() {
+                operation.record_failure(target, detail.clone());
+            }
+            self.status = StatusLine {
+                text: detail,
+                is_error: true,
+            };
+            return Ok(AppAction::None);
+        }
+
+        self.next_bulk_action_or_finish(false)
+    }
+
+    fn finish_bulk_operation(&mut self, aborted: bool) -> Result<()> {
+        let Some(operation) = self.bulk_operation.as_mut() else {
+            return Ok(());
+        };
+        operation.finish(aborted);
+        let kind = operation.kind;
+        let completed = operation.completed_units;
+        let failed = operation.failed_units;
+        self.status = StatusLine {
+            text: match kind {
+                BulkKind::MarkRead => {
+                    format!("marked {completed} msgs as read ({failed} failed)")
+                }
+                BulkKind::Reset => format!("reset {completed} identities ({failed} failed)"),
+                BulkKind::Rename => format!("renamed {completed} identities ({failed} failed)"),
+                BulkKind::Despawn => format!("despawned {completed} agents ({failed} failed)"),
+            },
+            is_error: failed > 0,
+        };
+        self.refresh_team_summaries()?;
+        self.reload_selected_team()?;
+        if matches!(kind, BulkKind::Reset | BulkKind::Rename | BulkKind::Despawn) {
+            self.reload_agents()?;
+            self.refresh_audit_analytics()?;
+        }
+        if kind == BulkKind::MarkRead {
+            let messages = self.database.all_messages()?;
+            if let Some(filter) = self.bulk_filter.as_mut() {
+                filter.all_messages = messages;
+                filter.recompute(chrono::Utc::now());
+            }
+            if self.audit_report.is_some() {
+                self.refresh_audit_analytics()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn export_bulk_filter(&mut self, format: ExportFormat) -> Result<()> {
+        let filter = self.bulk_filter.as_ref().context("bulk filter is not loaded")?;
+        let messages = filter.messages().cloned().collect::<Vec<_>>();
+        anyhow::ensure!(!messages.is_empty(), "filter has no results");
+        let path = export_bulk_messages(
+            &self.paths.report_dir,
+            &messages,
+            format,
+            chrono::Utc::now(),
+        )?;
+        self.status = StatusLine {
+            text: format!("exported: {}", path.display()),
+            is_error: false,
+        };
+        Ok(())
+    }
+
+    fn open_bulk_reset_preview(&mut self) {
+        if let Some(operation) = &self.bulk_operation
+            && !matches!(operation.state, BulkRunState::Complete { .. })
+        {
+            self.status = validation_status("bulk operation already running".to_owned());
+            return;
+        }
+        if self.agent_teams.is_empty() && let Err(error) = self.reload_agents() {
+            self.set_error(&error);
+            return;
+        }
+        let candidates = self
+            .zombies
+            .iter()
+            .map(|row| (row.team.clone(), row.agent.clone()))
+            .chain(
+                self.stale_unreads
+                    .iter()
+                    .map(|row| (row.team.clone(), row.to_agent.clone())),
+            )
+            .collect::<HashSet<_>>();
+        let mut seen = HashSet::new();
+        let targets = self
+            .agent_teams
+            .iter()
+            .flat_map(|team| &team.identities)
+            .filter(|identity| candidates.contains(&(identity.team.clone(), identity.name.clone())))
+            .filter(|identity| self.current_identity.as_deref() != Some(&identity.name))
+            .filter(|identity| {
+                seen.insert((
+                    identity.team.clone(),
+                    identity.name.clone(),
+                    identity.agent_type.clone(),
+                    identity.project.clone(),
+                ))
+            })
+            .map(|identity| {
+                BulkTarget::Reset(ResetTarget {
+                    team: identity.team.clone(),
+                    agent: identity.name.clone(),
+                    agent_type: identity.agent_type.clone(),
+                    project: identity.project.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            self.status = validation_status("no resettable stale/zombie identities".to_owned());
+            return;
+        }
+        self.bulk_operation = None;
+        self.bulk_cancel = None;
+        self.bulk_modal = Some(BulkModal::Preview {
+            kind: BulkKind::Reset,
+            targets,
+            confirm: String::new(),
+            scroll: 0,
+        });
+    }
+
+    fn open_bulk_rename_wizard(&mut self) {
+        if self.agent_teams.is_empty() && let Err(error) = self.reload_agents() {
+            self.set_error(&error);
+            return;
+        }
+        let targets = naming_violations(&self.agent_teams);
+        if targets.is_empty() {
+            self.status = StatusLine {
+                text: "no naming violations".to_owned(),
+                is_error: false,
+            };
+            return;
+        }
+        self.bulk_operation = None;
+        self.bulk_cancel = None;
+        self.bulk_modal = Some(BulkModal::RenameEdit {
+            targets,
+            selected: 0,
+            editing: false,
+        });
+    }
+
+    fn validate_bulk_renames(&self, targets: &[RenameTarget]) -> Result<(), String> {
+        let mut proposed = HashSet::new();
+        let replaced = targets
+            .iter()
+            .map(|target| (target.team.clone(), target.old.clone()))
+            .collect::<HashSet<_>>();
+        for target in targets {
+            validate_agent_name(&target.new, &target.agent_type)?;
+            if target.new == target.old {
+                return Err(format!("{}: proposed name is unchanged", target.old));
+            }
+            if !proposed.insert((target.team.clone(), target.new.clone())) {
+                return Err(format!("duplicate proposed name: {}/{}", target.team, target.new));
+            }
+            let collides = self.agent_teams.iter().any(|team| {
+                team.name == target.team
+                    && team.identities.iter().any(|identity| {
+                        identity.name == target.new
+                            && !replaced.contains(&(target.team.clone(), identity.name.clone()))
+                    })
+            });
+            if collides {
+                return Err(format!("name already exists: {}/{}", target.team, target.new));
+            }
+        }
+        Ok(())
+    }
+
+    fn open_despawn_preview(&mut self) {
+        if self.agent_focus != AgentFocus::Identities {
+            self.status = validation_status(
+                "D: switch to identity focus (Tab) and select a target".to_owned(),
+            );
+            return;
+        }
+        let Some(identity) = self.selected_agent_identity().cloned() else {
+            self.status = validation_status("no identity selected".to_owned());
+            return;
+        };
+        let from = self
+            .current_identity
+            .as_ref()
+            .filter(|name| {
+                name.as_str() != identity.name
+                    && self.selected_agent_team().is_some_and(|team| {
+                        team.identities
+                            .iter()
+                            .any(|row| row.name == name.as_str())
+                    })
+            })
+            .cloned()
+            .or_else(|| {
+                self.selected_agent_team().and_then(|team| {
+                    team.identities
+                        .iter()
+                        .find(|row| row.name != identity.name)
+                        .map(|row| row.name.clone())
+                })
+            })
+            .unwrap_or_else(|| identity.name.clone());
+        self.bulk_operation = None;
+        self.bulk_cancel = None;
+        self.bulk_modal = Some(BulkModal::Preview {
+            kind: BulkKind::Despawn,
+            targets: vec![BulkTarget::Despawn(DespawnTarget {
+                team: identity.team,
+                from,
+                name: identity.name,
+            })],
+            confirm: String::new(),
+            scroll: 0,
+        });
     }
 
     fn refresh_audit_analytics(&mut self) -> Result<()> {
@@ -2123,11 +2813,11 @@ impl App {
     fn show_audit_detail(&mut self) {
         self.audit_detail = match self.selected_audit_item() {
             Some(AuditSelection::Zombie(zombie)) => Some(format!(
-                "Zombie identity\n\nteam: {}\nagent: {}\nreason: no traffic in {} days\n\nD shows a reset.sh command; it is never executed by this TUI.",
+                "Zombie identity\n\nteam: {}\nagent: {}\nreason: no traffic in {} days\n\nD shows its reset.sh command. B previews and batch-confirms every stale/zombie reset before execution.",
                 zombie.team, zombie.agent, ANALYTICS_WINDOW_DAYS
             )),
             Some(AuditSelection::Stale(stale)) => Some(format!(
-                "Stale unread #{}\n\nteam: {}\nfrom: {}\nto: {}\ncreated: {}\n\n{}\n\nM delegates read marking to inbox.sh.",
+                "Stale unread #{}\n\nteam: {}\nfrom: {}\nto: {}\ncreated: {}\n\n{}\n\nM delegates read marking to inbox.sh. B includes its recipient in the reset preview when registered.",
                 stale.id,
                 stale.team,
                 stale.from_agent,
@@ -2601,12 +3291,24 @@ impl App {
             self.status = validation_status("no identity selected".to_owned());
             return Ok(());
         };
+        let run_dir = self
+            .paths
+            .scripts_dir
+            .parent()
+            .map(|path| path.join("run"))
+            .unwrap_or_else(|| self.paths.scripts_dir.join("../run"));
+        let lock = match actas_lock_status(&run_dir, &identity.team, &identity.name) {
+            LockStatus::Unlocked => "unlocked".to_owned(),
+            LockStatus::Owned(owner) => owner,
+            LockStatus::ParseError => "lock parse error".to_owned(),
+        };
         self.agent_identity_info = Some(format!(
-            "Agent: {}\nTeam: {}\nCli-type: {}\nProject: {}\nLast seen: {}\nSent (30d): {}\nReceived (30d): {}",
+            "Agent: {}\nTeam: {}\nCli-type: {}\nProject: {}\nActas lock: {}\nLast seen: {}\nSent (30d): {}\nReceived (30d): {}",
             identity.name,
             identity.team,
             identity.agent_type,
             identity.project,
+            lock,
             identity.last_seen_at.as_deref().unwrap_or("-"),
             identity.sent_30d,
             identity.received_30d,
@@ -3037,6 +3739,9 @@ mod tests {
         InFlightOperation, InputMode, Screen, StatusLine,
     };
     use crate::agents::{AgentFocus, AgentModal, AgentOperation};
+    use crate::bulk::{
+        BulkKind, BulkRunState, BulkTarget, DespawnTarget, FilterPeriod, MarkReadTarget,
+    };
     use crate::config::Paths;
     use crate::db::Message;
     use crate::exec::CommandResult;
@@ -4363,5 +5068,203 @@ mod tests {
         };
         app.warn_notify_failure_once();
         assert_eq!(app.status.text, "something else", "second warning must be muted");
+    }
+
+    #[test]
+    fn bulk_mark_read_requires_exact_yes_then_tracks_message_progress() {
+        let (_temp, mut app) = fixture_app_with_messages(&[(
+            "claude-main",
+            "codex-worker",
+            "bulk me",
+        )]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .expect("open bulk");
+        let filter = app.bulk_filter.as_mut().expect("filter loaded");
+        filter.period = FilterPeriod::All;
+        filter.recompute(chrono::Utc::now());
+        app.handle_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE))
+            .expect("preview");
+        for character in ['Y', 'E', 'S'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .expect("confirm text");
+        }
+        let action = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm");
+        assert!(matches!(
+            action,
+            AppAction::RunBulk {
+                target: BulkTarget::MarkRead(_),
+                force_despawn: false
+            }
+        ));
+        let target = app
+            .bulk_operation
+            .as_ref()
+            .and_then(|operation| operation.current_target())
+            .cloned()
+            .expect("target");
+        let next = app
+            .complete_bulk_target(
+                target,
+                Ok(CommandResult {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: "1 new message(s)".to_owned(),
+                    stderr: String::new(),
+                }),
+            )
+            .expect("completion");
+        assert!(matches!(next, AppAction::None));
+        assert_eq!(app.status.text, "marked 1 msgs as read (0 failed)");
+        assert!(matches!(
+            app.bulk_operation.as_ref().map(|operation| &operation.state),
+            Some(BulkRunState::Complete { aborted: false })
+        ));
+    }
+
+    #[test]
+    fn bulk_failure_waits_for_continue_before_dispatching_next_target() {
+        let (_temp, mut app) = fixture_app();
+        app.screen = Screen::BulkFilter;
+        let first = BulkTarget::MarkRead(MarkReadTarget {
+            team: "ops".to_owned(),
+            recipient: "codex-worker".to_owned(),
+            message_count: 2,
+        });
+        let second = BulkTarget::MarkRead(MarkReadTarget {
+            team: "ops".to_owned(),
+            recipient: "claude-main".to_owned(),
+            message_count: 1,
+        });
+        app.begin_bulk_operation(BulkKind::MarkRead, vec![first.clone(), second.clone()])
+            .expect("begin");
+        app.complete_bulk_target(
+            first,
+            Ok(CommandResult {
+                success: false,
+                exit_code: Some(2),
+                stdout: String::new(),
+                stderr: "inbox failed".to_owned(),
+            }),
+        )
+        .expect("failed step");
+        assert!(matches!(
+            app.bulk_operation.as_ref().map(|operation| &operation.state),
+            Some(BulkRunState::AwaitDecision { .. })
+        ));
+        let continue_action = app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+            .expect("continue");
+        assert!(matches!(
+            continue_action,
+            AppAction::RunBulk { target, .. } if target == second
+        ));
+        assert_eq!(
+            app.bulk_operation
+                .as_ref()
+                .map(|operation| operation.failed_units),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn graceful_despawn_failure_requires_explicit_force_choice() {
+        let (_temp, mut app) = fixture_app();
+        app.screen = Screen::Agents;
+        let target = BulkTarget::Despawn(DespawnTarget {
+            team: "ops".to_owned(),
+            from: "claude-main".to_owned(),
+            name: "codex-worker".to_owned(),
+        });
+        app.begin_bulk_operation(BulkKind::Despawn, vec![target.clone()])
+            .expect("begin");
+        app.complete_bulk_target(
+            target.clone(),
+            Ok(CommandResult {
+                success: false,
+                exit_code: Some(3),
+                stdout: "status=timeout".to_owned(),
+                stderr: "retry with --force".to_owned(),
+            }),
+        )
+        .expect("graceful failure");
+        assert!(matches!(
+            app.bulk_operation.as_ref().map(|operation| &operation.state),
+            Some(BulkRunState::AwaitForce { .. })
+        ));
+        let force = app
+            .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("force choice");
+        assert!(matches!(
+            force,
+            AppAction::RunBulk {
+                target: force_target,
+                force_despawn: true
+            } if force_target == target
+        ));
+    }
+
+    #[test]
+    fn escape_signals_bulk_cancel_channel_and_finishes_aborted() {
+        let (_temp, mut app) = fixture_app();
+        app.screen = Screen::BulkFilter;
+        let target = BulkTarget::MarkRead(MarkReadTarget {
+            team: "ops".to_owned(),
+            recipient: "codex-worker".to_owned(),
+            message_count: 1,
+        });
+        app.begin_bulk_operation(BulkKind::MarkRead, vec![target.clone()])
+            .expect("begin");
+        let receiver = app.bulk_cancel_receiver().expect("cancel receiver");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel key");
+        assert!(*receiver.borrow());
+        app.complete_bulk_target(target, Err("cancelled: inbox.sh".to_owned()))
+            .expect("cancel completion");
+        assert!(matches!(
+            app.bulk_operation.as_ref().map(|operation| &operation.state),
+            Some(BulkRunState::Complete { aborted: true })
+        ));
+        assert_eq!(
+            app.bulk_operation
+                .as_ref()
+                .map(|operation| operation.failed_units),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn identity_info_reports_actas_lock_owner() {
+        let (temp, mut app) = fixture_app_with_messages(&[(
+            "claude-main",
+            "codex-worker",
+            "hello",
+        )]);
+        let run_dir = temp.path().join("run");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(
+            run_dir.join("actas.ops__codex-worker.session"),
+            "session-owner.123\n",
+        )
+        .expect("lock");
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE))
+            .expect("agents");
+        app.agent_focus = AgentFocus::Identities;
+        app.agent_identity_index = app
+            .selected_agent_team()
+            .and_then(|team| {
+                team.identities
+                    .iter()
+                    .position(|identity| identity.name == "codex-worker")
+            })
+            .expect("codex identity");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("info");
+        assert!(
+            app.agent_identity_info
+                .as_deref()
+                .is_some_and(|info| info.contains("Actas lock: session-owner.123"))
+        );
     }
 }

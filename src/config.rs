@@ -42,6 +42,10 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub startup_probe: bool,
 
+    /// 実DBの全件loadとbulk previewを80x24メモリ端末で検査して終了する
+    #[arg(long, hide = true)]
+    pub bulk_preview_probe: bool,
+
     /// 全UIから色を除去する (NO_COLOR env でも同じ効果、このflagが優先)
     #[arg(long)]
     pub no_color: bool,

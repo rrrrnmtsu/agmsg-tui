@@ -4,21 +4,26 @@
 //! being useful (nobody parses "31h ago" faster than a date) and actively
 //! misleads about which calendar day a message landed on, so we fall back
 //! to an absolute `MMM-DD HH:MM` once the delta crosses a day.
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 
-/// `created_at` is stored as `%Y-%m-%dT%H:%M:%SZ` (RFC3339-compatible).
+/// `created_at` is stored as `%Y-%m-%dT%H:%M:%SZ` (RFC3339-compatible, UTC).
 /// Unparsable input is returned unchanged rather than panicking — a display
 /// concern, not a fatal one.
+///
+/// Why not: absolute-format branch converts to `chrono::Local` so
+/// "Jul-19 12:34" reads as wall-clock on the user's machine, not UTC.
+/// Relative branches ("Nm/Nh ago") stay in UTC — duration diff is
+/// timezone-invariant.
 pub fn format_timestamp(created_at: &str, now: DateTime<Utc>) -> String {
     let Ok(parsed) = DateTime::parse_from_rfc3339(created_at) else {
         return created_at.to_owned();
     };
-    let parsed = parsed.with_timezone(&Utc);
-    let delta = now.signed_duration_since(parsed);
+    let parsed_utc = parsed.with_timezone(&Utc);
+    let delta = now.signed_duration_since(parsed_utc);
 
     if delta < Duration::zero() {
         // Clock skew / future timestamp: absolute is less confusing than "-1m ago".
-        return parsed.format("%b-%d %H:%M").to_string();
+        return parsed_utc.with_timezone(&Local).format("%b-%d %H:%M").to_string();
     }
     if delta < Duration::hours(1) {
         return format!("{}m ago", delta.num_minutes());
@@ -26,7 +31,7 @@ pub fn format_timestamp(created_at: &str, now: DateTime<Utc>) -> String {
     if delta < Duration::hours(24) {
         return format!("{}h ago", delta.num_hours());
     }
-    parsed.format("%b-%d %H:%M").to_string()
+    parsed_utc.with_timezone(&Local).format("%b-%d %H:%M").to_string()
 }
 
 /// True when `created_at` falls within `window` of `now` — used for the
@@ -56,10 +61,12 @@ mod tests {
     }
 
     #[test]
-    fn past_twenty_four_hours_falls_back_to_absolute_date() {
+    fn past_twenty_four_hours_falls_back_to_absolute_date_in_local_time() {
         let now = Utc::now();
         let past = now - Duration::hours(30);
-        let expected = past.format("%b-%d %H:%M").to_string();
+        // Absolute format renders in the user's local timezone so wall-clock
+        // matches (JST for the primary user).
+        let expected = past.with_timezone(&Local).format("%b-%d %H:%M").to_string();
         assert_eq!(format_timestamp(&past.to_rfc3339(), now), expected);
     }
 

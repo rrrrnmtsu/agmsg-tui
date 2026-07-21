@@ -5,7 +5,9 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::cursor::Show;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -18,6 +20,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at, timeout};
 
 use agmsg_tui::agents::AgentOperation;
 use agmsg_tui::app::{App, AppAction, InFlightOperation, Screen};
+use agmsg_tui::bulk::BulkTarget;
 use agmsg_tui::clipboard;
 use agmsg_tui::config::{Cli, Paths};
 use agmsg_tui::exec::CommandResult;
@@ -47,6 +50,10 @@ enum AsyncCommandResult {
         operation: AgentOperation,
         result: Result<CommandResult, String>,
     },
+    Bulk {
+        target: BulkTarget,
+        result: Result<CommandResult, String>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -69,6 +76,26 @@ async fn main() -> Result<()> {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend)?;
         terminal.draw(|frame| ui::render(frame, &app))?;
+        return Ok(());
+    }
+    if cli.bulk_preview_probe {
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))?;
+        app.handle_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE))?;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| ui::render(frame, &app))?;
+        let (loaded, filtered) = app
+            .bulk_filter
+            .as_ref()
+            .map(|filter| (filter.all_messages.len(), filter.results.len()))
+            .unwrap_or_default();
+        let preview_targets = match app.bulk_modal.as_ref() {
+            Some(agmsg_tui::bulk::BulkModal::Preview { targets, .. }) => targets.len(),
+            _ => 0,
+        };
+        println!(
+            "bulk_loaded={loaded} filtered_7d={filtered} preview_targets={preview_targets}"
+        );
         return Ok(());
     }
 
@@ -143,6 +170,7 @@ async fn run_tui(
 
         while let Ok(completion) = command_rx.try_recv() {
             app.finish_operation();
+            let mut followup = None;
             match completion {
                 AsyncCommandResult::Send(result) => match result {
                     Ok(result) => {
@@ -172,6 +200,23 @@ async fn run_tui(
                     }
                     Err(error) => app.complete_agent_error(&anyhow::anyhow!(error)),
                 },
+                AsyncCommandResult::Bulk { target, result } => {
+                    match app.complete_bulk_target(target, result) {
+                        Ok(action) => followup = Some(action),
+                        Err(error) => app.set_error(&error),
+                    }
+                }
+            }
+            if let Some(action) = followup {
+                execute_action(
+                    app,
+                    &scripts,
+                    &audit_tx,
+                    &health_tx,
+                    &command_tx,
+                    action,
+                )
+                .await;
             }
             needs_draw = true;
         }
@@ -408,6 +453,67 @@ async fn execute_action(
             if let Err(error) = app.export_audit_report() {
                 app.set_error(&error);
             }
+        }
+        AppAction::ExportBulk(format) => {
+            if let Err(error) = app.export_bulk_filter(format) {
+                app.set_error(&error);
+            }
+        }
+        AppAction::RunBulk {
+            target,
+            force_despawn,
+        } => {
+            if !app.start_operation(InFlightOperation::Bulk) {
+                return;
+            }
+            let Some(cancel) = app.bulk_cancel_receiver() else {
+                app.finish_operation();
+                app.set_error(&anyhow::anyhow!("bulk cancel channel is unavailable"));
+                return;
+            };
+            let scripts = scripts.clone();
+            let command_tx = command_tx.clone();
+            tokio::spawn(async move {
+                let result = match &target {
+                    BulkTarget::MarkRead(target) => {
+                        scripts
+                            .mark_recipient_read_cancellable(
+                                &target.team,
+                                &target.recipient,
+                                cancel,
+                            )
+                            .await
+                    }
+                    BulkTarget::Reset(target) => {
+                        scripts
+                            .reset_cancellable(
+                                &target.project,
+                                &target.agent_type,
+                                &target.agent,
+                                cancel,
+                            )
+                            .await
+                    }
+                    BulkTarget::Rename(target) => {
+                        scripts
+                            .rename_cancellable(&target.team, &target.old, &target.new, cancel)
+                            .await
+                    }
+                    BulkTarget::Despawn(target) => {
+                        scripts
+                            .despawn_cancellable(
+                                &target.team,
+                                &target.from,
+                                &target.name,
+                                force_despawn,
+                                cancel,
+                            )
+                            .await
+                    }
+                }
+                .map_err(|error| error.to_string());
+                let _ = command_tx.send(AsyncCommandResult::Bulk { target, result });
+            });
         }
         AppAction::Yank(body) => match clipboard::yank(&body) {
             Ok(true) => {

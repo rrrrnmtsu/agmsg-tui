@@ -1,6 +1,6 @@
 # agmsg-tui
 
-`agmsg` の team、member、room、送信、live tail、既読化、運用 audit、Health & Trends、agent 管理をターミナル内で扱います。SQLite は常に read-only 接続し、全ての書き込みは agmsg script に委譲します。agent reset は `YES` 確認後に `reset.sh` を呼び、対象projectを保持するため `AGMSG_RESOLVE_PROJECT=0` をrunner側で常時付与します。
+`agmsg` の team、member、room、送信、live tail、既読化、運用 audit、Health & Trends、cross-team 一括管理、agent 管理をターミナル内で扱います。SQLite は常に read-only 接続し、全ての書き込みは agmsg script に委譲します。agent reset は `YES` 確認後に `reset.sh` を呼び、対象projectを保持するため `AGMSG_RESOLVE_PROJECT=0` をrunner側で常時付与します。
 
 ## Build and run
 
@@ -52,6 +52,9 @@ cargo build --release
 - `s`: 選択messageと同じsenderの直近messageへジャンプ
 - MEMBER: `Enter`で宛先指定composer、`I`でinfo、`F`でfilter、`M`で既読化
 - `Ctrl-A` / `a`: audit dashboard を開く
+- `Ctrl-F`: cross-team Bulk Filter を開く（再度`Ctrl-F` / `Esc`でMainへ戻る）
+- Bulk Filter: `Tab`でagent(from/to)・期間(7d/30d/all)・body substring・結果を移動。filter変更はload済み全messageをin-memory再集計
+- Bulk Filter: `M`で未読結果のpreview → `YES` → `inbox.sh`逐次既読化、`E`でMarkdown/JSONを`~/tmp/agmsg-bulk-<timestamp>.*`へexport
 - `H`: Health & Trends を開く（再度`H` / `Esc`でMainへ戻る、`q`は終了）
 - Health: `j`/`k`でteam選択、`t`で7d/30d切替、`R`で非同期refresh
 - Health: delivery mode、bridge生死（`●`全稼働 / `◐`一部 / `○`停止 / `-`なし）、最終message、stale unread、team/agent trafficを表示
@@ -60,7 +63,8 @@ cargo build --release
 - Agents: `t` / `Tab`でteam・identity focus、`n`でagent作成/join、`R`でrename
 - Agents: team focusの`T`でteam rename、`L`で現identityのteam離脱
 - Agents: identity focusの`X` / `Del`でreset（`YES`完全一致確認、self-reset拒否）、`r`で再読込
-- Agents: identity focusの`Enter`でidentity info popup（`Esc`/`Enter`で閉じる）
+- Agents: identity focusの`D`でgraceful despawn（30s timeout）。失敗時だけ`--force`を提案
+- Agents: identity focusの`Enter`でidentity info popup（actas lock ownerをread-only表示、`Esc`/`Enter`で閉じる）
 - Agents: spawn/join/rename/reset/leave はすべて非同期実行（confirm直後にUIへ制御が戻り、spinner表示）
 - `?`: help
 - `q`: 即時終了。Mainの`Esc`はsearch/filter/popupの解除専用
@@ -68,6 +72,7 @@ cargo build --release
 - composer: 2048B超で黄、4096B超で赤の警告（4096B超は送信をblock）
 - audit: `R`でrefresh、`h`/`l`でteam matrix切替、`j`/`k`でaction選択、`g`で選択先頭へジャンプ
 - audit: `D`でzombie reset command表示、`M`でstale unreadを`inbox.sh`経由で既読化
+- audit: `B`でstale/zombie identityの一括reset、`W`で匿名/連番identityの提案名編集・一括rename。いずれもpreview → `YES` → 逐次実行
 - audit: `Enter`で詳細、`E`/`x`で`~/tmp/agmsg-report-<YYYYMMDD-HHMM>.md`へexport、`Ctrl-A`/`Tab`でmainへ戻る
 - audit: 表示中は60秒ごとに非同期auto-refresh（手動refreshとの重複実行を抑止）
 
@@ -81,4 +86,4 @@ tmux越しのOSC 52を使う場合は、tmux 3.3+で`set -g allow-passthrough on
 
 ## Scope
 
-Phase 1〜11として、audit dashboard、Health & Trends、room可読性改善、syntax highlight、全DB検索、状態永続化、通知/burst alert、agent管理、subprocess非同期化・timeoutを実装しています。agent生成は既存`spawn.sh --no-wait`へ委譲し、TUI自体はPTYを管理しません。
+Phase 1〜12として、audit dashboard、Health & Trends、cross-team filter/export/bulk action、room可読性改善、syntax highlight、全DB検索、状態永続化、通知/burst alert、agent管理、subprocess非同期化・timeoutを実装しています。bulk actionは対象全件previewとbatch単位の`YES`確認後に逐次script委譲し、失敗時はcontinue/abort、実行中は`Esc`でcancel channel経由のcurrent command中断を選べます。agent生成は既存`spawn.sh --no-wait`へ委譲し、TUI自体はPTYを管理しません。

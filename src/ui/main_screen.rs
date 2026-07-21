@@ -255,7 +255,7 @@ fn render_room(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     let footer = Line::from(vec![
-        Span::raw("  [c][H:health][r:read-recipient][R][/][?:help]  "),
+        Span::raw("  [c][H:health][Ctrl-F:bulk][r:read-recipient][R][/][?:help]  "),
         Span::styled("details: ?", Style::default().fg(Color::DarkGray)),
     ]);
     lines.push(footer);
@@ -355,6 +355,7 @@ const HELP_LEFT: &[HelpSection] = &[
             ("Ctrl+A", "Toggle audit dashboard"),
             ("A", "Agents screen"),
             ("H", "Health & trends screen"),
+            ("Ctrl+F", "Cross-team bulk filter"),
             ("Ctrl+N", "Notification settings"),
             ("Ctrl+B", "Mute / unmute terminal bell"),
             ("?", "Toggle this help"),
@@ -399,6 +400,17 @@ const HELP_LEFT: &[HelpSection] = &[
             ("q", "Quit agmsg-tui"),
         ],
     },
+    HelpSection {
+        title: "BULK FILTER",
+        entries: &[
+            ("Ctrl+F / Esc", "Toggle bulk filter / main"),
+            ("Tab / S-Tab", "Cycle agent / period / body / results"),
+            ("←/→  7/3/a", "Select 7d / 30d / all"),
+            ("j/k  g/G", "Select result / edges"),
+            ("M", "Preview filtered unread marking"),
+            ("E", "Export Markdown / JSON"),
+        ],
+    },
 ];
 
 const HELP_RIGHT: &[HelpSection] = &[
@@ -426,6 +438,8 @@ const HELP_RIGHT: &[HelpSection] = &[
             ("R / a", "Refresh audit"),
             ("Enter", "Item detail"),
             ("D", "Show reset command"),
+            ("B", "Bulk reset stale / zombie identities"),
+            ("W", "Bulk rename naming violations"),
             ("M", "Mark stale unread"),
             ("E / x", "Export report"),
             ("Tab / Ctrl+A", "Back to main"),
@@ -441,6 +455,7 @@ const HELP_RIGHT: &[HelpSection] = &[
             ("R", "Rename identity (any focus)"),
             ("T", "Rename team (any focus)"),
             ("X / Del", "Reset identity (identity focus)"),
+            ("D", "Despawn identity (identity focus)"),
             ("L", "Leave (any focus)"),
             ("Enter", "Identity info (identity focus)"),
         ],
