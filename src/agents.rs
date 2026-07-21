@@ -1,6 +1,17 @@
 use crate::db::AgentIdentitySummary;
 
-pub const CLI_TYPES: [&str; 5] = ["claude-code", "codex", "gemini", "copilot", "opencode"];
+pub const CLI_TYPES: [&str; 10] = [
+    "claude-code",
+    "codex",
+    "cursor",
+    "gemini",
+    "copilot",
+    "opencode",
+    "kimi",
+    "hermes",
+    "antigravity",
+    "grok-build",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentFocus {
