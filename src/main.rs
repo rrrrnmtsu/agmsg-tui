@@ -22,11 +22,13 @@ use agmsg_tui::clipboard;
 use agmsg_tui::config::{Cli, Paths};
 use agmsg_tui::exec::CommandResult;
 use agmsg_tui::exec::ScriptRunner;
+use agmsg_tui::health::{HealthSnapshot, collect_health_snapshot};
 use agmsg_tui::notify::{NotificationSink, PendingNotification, emit_bell};
 use agmsg_tui::poll::LivePoller;
 use agmsg_tui::ui;
 
 const AUDIT_REFRESH_PERIOD: Duration = Duration::from_secs(60);
+const HEALTH_REFRESH_PERIOD: Duration = Duration::from_secs(60);
 const SPINNER_PERIOD: Duration = Duration::from_millis(100);
 
 enum AsyncCommandResult {
@@ -96,10 +98,14 @@ async fn run_tui(
     let last_seen_id = app.database.last_seen_id()?;
     let mut poller = LivePoller::new(last_seen_id);
     let (audit_tx, mut audit_rx) = unbounded_channel::<Result<CommandResult, String>>();
+    let (health_tx, mut health_rx) = unbounded_channel::<Result<HealthSnapshot, String>>();
     let (command_tx, mut command_rx) = unbounded_channel::<AsyncCommandResult>();
     let mut audit_refresh =
         interval_at(Instant::now() + AUDIT_REFRESH_PERIOD, AUDIT_REFRESH_PERIOD);
     audit_refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut health_refresh =
+        interval_at(Instant::now() + HEALTH_REFRESH_PERIOD, HEALTH_REFRESH_PERIOD);
+    health_refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut spinner = interval_at(Instant::now() + SPINNER_PERIOD, SPINNER_PERIOD);
     spinner.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut needs_draw = true;
@@ -123,6 +129,14 @@ async fn run_tui(
                     }
                 }
                 Err(error) => app.complete_audit_error(error),
+            }
+            needs_draw = true;
+        }
+
+        while let Ok(result) = health_rx.try_recv() {
+            match result {
+                Ok(snapshot) => app.complete_health(snapshot),
+                Err(error) => app.complete_health_error(error),
             }
             needs_draw = true;
         }
@@ -172,7 +186,18 @@ async fn run_tui(
                     if matches!(action, AppAction::RefreshAudit) {
                         audit_refresh.reset();
                     }
-                    execute_action(app, &scripts, &audit_tx, &command_tx, action).await;
+                    if matches!(action, AppAction::RefreshHealth) {
+                        health_refresh.reset();
+                    }
+                    execute_action(
+                        app,
+                        &scripts,
+                        &audit_tx,
+                        &health_tx,
+                        &command_tx,
+                        action,
+                    )
+                    .await;
                     needs_draw = true;
                 }
                 Event::Mouse(mouse) => {
@@ -253,7 +278,33 @@ async fn run_tui(
             && app.screen == Screen::Audit
         {
             let action = app.request_audit_refresh();
-            execute_action(app, &scripts, &audit_tx, &command_tx, action).await;
+            execute_action(
+                app,
+                &scripts,
+                &audit_tx,
+                &health_tx,
+                &command_tx,
+                action,
+            )
+            .await;
+            needs_draw = true;
+        }
+
+        if timeout(Duration::from_millis(1), health_refresh.tick())
+            .await
+            .is_ok()
+            && app.screen == Screen::Health
+        {
+            let action = app.request_health_refresh();
+            execute_action(
+                app,
+                &scripts,
+                &audit_tx,
+                &health_tx,
+                &command_tx,
+                action,
+            )
+            .await;
             needs_draw = true;
         }
     }
@@ -263,6 +314,7 @@ async fn execute_action(
     app: &mut App,
     scripts: &ScriptRunner,
     audit_tx: &UnboundedSender<Result<CommandResult, String>>,
+    health_tx: &UnboundedSender<Result<HealthSnapshot, String>>,
     command_tx: &UnboundedSender<AsyncCommandResult>,
     action: AppAction,
 ) {
@@ -332,6 +384,24 @@ async fn execute_action(
             tokio::spawn(async move {
                 let result = scripts.audit().await.map_err(|error| error.to_string());
                 let _ = audit_tx.send(result);
+            });
+        }
+        AppAction::RefreshHealth => {
+            let database = app.database.clone();
+            let teams_dir = app.paths.teams_dir.clone();
+            let run_dir = app
+                .paths
+                .scripts_dir
+                .parent()
+                .map(|path| path.join("run"))
+                .unwrap_or_else(|| app.paths.scripts_dir.join("../run"));
+            let scripts = scripts.clone();
+            let health_tx = health_tx.clone();
+            tokio::spawn(async move {
+                let result = collect_health_snapshot(&database, &teams_dir, &run_dir, &scripts)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = health_tx.send(result);
             });
         }
         AppAction::ExportReport => {

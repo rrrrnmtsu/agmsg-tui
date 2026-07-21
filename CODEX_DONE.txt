@@ -1,0 +1,10 @@
+agmsg-tui Phase 9 (old Phase 8) complete on master.
+
+- S8-1 through S8-8: implemented
+- cargo test: 92 passed (6 new)
+- cargo clippy --all-targets -- -D warnings: passed
+- cargo build --release: warning zero
+- real DB: 5 teams / 754 messages, READ_ONLY preserved
+- async PTY smoke: 2s fake inbox kept 100ms spinner responsive
+- startup probe: 5-run average 6.104ms
+- push: not performed

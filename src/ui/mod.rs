@@ -1,6 +1,7 @@
 mod audit;
 mod agents;
 mod composer;
+mod health;
 mod main_screen;
 mod notification_settings;
 
@@ -137,15 +138,16 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     match app.screen {
         Screen::Audit => audit::render(frame, app),
         Screen::Agents => agents::render(frame, app),
+        Screen::Health => health::render(frame, app),
         Screen::Composer => {
             main_screen::render(frame, app);
             composer::render(frame, app);
         }
         Screen::Help => {
-            if app.help_return_screen == Screen::Agents {
-                agents::render(frame, app);
-            } else {
-                main_screen::render(frame, app);
+            match app.help_return_screen {
+                Screen::Agents => agents::render(frame, app),
+                Screen::Health => health::render(frame, app),
+                _ => main_screen::render(frame, app),
             }
             main_screen::render_help(frame, app);
         }
@@ -165,7 +167,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::Duration;
 
+    use chrono::NaiveDate;
     use ratatui::{
         Terminal,
         backend::{Backend, TestBackend},
@@ -175,9 +179,13 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     use super::render;
-    use crate::app::{App, Screen};
+    use crate::app::{App, AppAction, Screen};
     use crate::config::Paths;
+    use crate::db::{AgentTraffic, DailyTraffic};
     use crate::exec::CommandResult;
+    use crate::health::{
+        BridgeStatus, DeliveryMode, HealthSnapshot, TeamHealth,
+    };
 
     fn agents_fixture() -> (TempDir, App) {
         let temp = tempdir().expect("tempdir");
@@ -221,6 +229,86 @@ mod tests {
         })
         .expect("app");
         (temp, app)
+    }
+
+    fn health_snapshot() -> HealthSnapshot {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 21).expect("fixture date");
+        let traffic = vec![
+            DailyTraffic {
+                date,
+                count: 3,
+                burst: false,
+            },
+            DailyTraffic {
+                date,
+                count: 8,
+                burst: false,
+            },
+            DailyTraffic {
+                date,
+                count: 21,
+                burst: false,
+            },
+        ];
+        let ops = TeamHealth {
+            name: "ops-hub".to_owned(),
+            orphan: false,
+            delivery: DeliveryMode::Monitor,
+            bridges: vec![
+                BridgeStatus {
+                    label: "claude-code".to_owned(),
+                    pid: 101,
+                    alive: true,
+                },
+                BridgeStatus {
+                    label: "codex".to_owned(),
+                    pid: 102,
+                    alive: true,
+                },
+            ],
+            last_msg_age: Some(Duration::from_secs(180)),
+            unread: 0,
+            stale_unread: false,
+            traffic_7d: traffic.clone(),
+            traffic_30d: traffic.clone(),
+            agents_7d: vec![
+                AgentTraffic {
+                    agent: "claude".to_owned(),
+                    sent: 58,
+                    received: 41,
+                },
+                AgentTraffic {
+                    agent: "codex".to_owned(),
+                    sent: 40,
+                    received: 52,
+                },
+            ],
+            agents_30d: Vec::new(),
+        };
+        let orphan = TeamHealth {
+            name: "old-team".to_owned(),
+            orphan: true,
+            delivery: DeliveryMode::Unknown,
+            bridges: Vec::new(),
+            last_msg_age: Some(Duration::from_secs(45 * 86_400)),
+            unread: 6,
+            stale_unread: true,
+            traffic_7d: vec![DailyTraffic {
+                date,
+                count: 0,
+                burst: false,
+            }],
+            traffic_30d: Vec::new(),
+            agents_7d: Vec::new(),
+            agents_30d: Vec::new(),
+        };
+        HealthSnapshot {
+            teams: vec![ops, orphan],
+            daily_total_7d: traffic.clone(),
+            daily_total_30d: traffic,
+            refreshed_at: "12:04:31".to_owned(),
+            burst_threshold: 150,
+        }
     }
 
     #[test]
@@ -365,6 +453,11 @@ mod tests {
         }
         assert!(snapshot.contains("Main Esc=clear only | q=quit"));
         assert!(snapshot.contains("agmsg-tui — Keybindings"));
+        app.help_scroll = u16::MAX;
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("draw scrolled help");
+        assert!(terminal.backend().to_string().contains("HEALTH"));
     }
 
     #[test]
@@ -572,5 +665,65 @@ mod tests {
         let snapshot = terminal.backend().to_string();
         assert!(snapshot.contains("self-reset is refused"));
         assert!(!snapshot.contains("confirm :"));
+    }
+
+    #[test]
+    fn health_snapshot_matches_wide_operational_layout_at_80_by_24() {
+        let (_temp, mut app) = agents_fixture();
+        let action = app
+            .handle_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE))
+            .expect("open health");
+        assert!(matches!(action, AppAction::RefreshHealth));
+        app.complete_health(health_snapshot());
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("draw health");
+        let snapshot = terminal.backend().to_string();
+        for needle in [
+            "HEALTH",
+            "[7d]",
+            "ops-hub",
+            "monitor",
+            "● 2/2 up",
+            "(orphan) old",
+            "6 !",
+            "ops-hub agents (7d)",
+            "daily total (7d)",
+            "burst>150: none",
+        ] {
+            assert!(snapshot.contains(needle), "health snapshot missing {needle}");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("toggle health window");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("select next health team");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("draw 30d health");
+        let snapshot = terminal.backend().to_string();
+        assert!(snapshot.contains("[30d]"));
+        assert!(snapshot.contains("old-team agents (30d)"));
+        let refresh = app
+            .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE))
+            .expect("refresh health");
+        assert!(matches!(refresh, AppAction::RefreshHealth));
+    }
+
+    #[test]
+    fn health_snapshot_drops_traffic_column_below_60_columns() {
+        let (_temp, mut app) = agents_fixture();
+        app.screen = Screen::Health;
+        app.health_snapshot = Some(health_snapshot());
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("draw narrow health");
+        let snapshot = terminal.backend().to_string();
+        for needle in ["TEAM", "MODE", "BRIDGE", "UNREAD", "ops-hub"] {
+            assert!(snapshot.contains(needle), "narrow snapshot missing {needle}");
+        }
+        assert!(!snapshot.contains("LAST MSG"));
+        assert!(!snapshot.contains("TRAFFIC"));
     }
 }

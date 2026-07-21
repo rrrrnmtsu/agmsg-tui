@@ -47,6 +47,48 @@ impl ScriptRunner {
         .await
     }
 
+    pub async fn delivery_status(&self, agent_type: &str, project: &str) -> Result<CommandResult> {
+        self.run(
+            "delivery.sh",
+            [
+                OsStr::new("status"),
+                OsStr::new(agent_type),
+                OsStr::new(project),
+            ],
+        )
+        .await
+    }
+
+    pub async fn process_status(&self, pids: &[u32]) -> Result<CommandResult> {
+        if pids.is_empty() {
+            return Ok(CommandResult {
+                success: true,
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+        let pid_list = pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut command = Command::new("/bin/ps");
+        command
+            .args(["-p", &pid_list, "-o", "pid="])
+            .kill_on_drop(true);
+        let output = match timeout(self.timeout, command.output()).await {
+            Ok(output) => output.context("/bin/ps を実行できません")?,
+            Err(_) => bail!("timeout: ps ({})", timeout_label(self.timeout)),
+        };
+        Ok(CommandResult {
+            success: output.status.success(),
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
+    }
+
     pub async fn send(
         &self,
         team: &str,

@@ -21,6 +21,7 @@ use crate::db::{
     Message, PairMatrix, STALE_UNREAD_DAYS, StaleUnread, TeamSummary, ZombieIdentity,
 };
 use crate::exec::{CommandResult, reset_command_display};
+use crate::health::{HealthSnapshot, TeamHealth};
 use crate::notify::{
     BURST_ALERT_DURATION, BurstTracker, NOTIFY_SETTING_COUNT, NotifySettings, PendingNotification,
 };
@@ -54,6 +55,7 @@ pub enum Screen {
     Composer,
     Audit,
     Agents,
+    Health,
     Help,
 }
 
@@ -175,6 +177,7 @@ pub enum AppAction {
         unread_count: usize,
     },
     RefreshAudit,
+    RefreshHealth,
     ExportReport,
     Yank(String),
     ManageAgent(AgentOperation),
@@ -234,6 +237,10 @@ pub struct App {
     pub audit_team_index: usize,
     pub audit_selected: usize,
     pub audit_detail: Option<String>,
+    pub health_snapshot: Option<HealthSnapshot>,
+    pub health_loading: bool,
+    pub health_window_days: u32,
+    pub health_team_index: usize,
     /// Sidebar width as a percentage, drag-resizable (`ui::SIDEBAR_MIN_PCT`..=`ui::SIDEBAR_MAX_PCT`).
     pub sidebar_pct: u16,
     /// True while a left-button drag started on the resize handle is still held.
@@ -334,6 +341,10 @@ impl App {
             audit_team_index: 0,
             audit_selected: 0,
             audit_detail: None,
+            health_snapshot: None,
+            health_loading: false,
+            health_window_days: 7,
+            health_team_index: 0,
             sidebar_pct: persisted
                 .sidebar_pct
                 .clamp(SIDEBAR_MIN_PCT, SIDEBAR_MAX_PCT),
@@ -572,6 +583,7 @@ impl App {
             }
             Screen::Audit => self.handle_audit_key(key),
             Screen::Agents => self.handle_agents_key(key),
+            Screen::Health => self.handle_health_key(key),
             Screen::Main => self.handle_main_key(key),
         };
         if self.persistence_snapshot() != before {
@@ -817,6 +829,45 @@ impl App {
         AppAction::RefreshAudit
     }
 
+    pub fn complete_health(&mut self, snapshot: HealthSnapshot) {
+        self.health_loading = false;
+        self.health_team_index = self
+            .health_team_index
+            .min(snapshot.teams.len().saturating_sub(1));
+        self.health_snapshot = Some(snapshot);
+        self.status = StatusLine {
+            text: "health refreshed".to_owned(),
+            is_error: false,
+        };
+    }
+
+    pub fn complete_health_error(&mut self, message: String) {
+        self.health_loading = false;
+        self.status = StatusLine {
+            text: message,
+            is_error: true,
+        };
+    }
+
+    pub fn request_health_refresh(&mut self) -> AppAction {
+        if self.health_loading {
+            return AppAction::None;
+        }
+        self.health_loading = true;
+        self.status = StatusLine {
+            text: "loading health...".to_owned(),
+            is_error: false,
+        };
+        AppAction::RefreshHealth
+    }
+
+    pub fn current_health_team(&self) -> Option<&TeamHealth> {
+        self.health_snapshot
+            .as_ref()?
+            .teams
+            .get(self.health_team_index)
+    }
+
     pub fn export_audit_report(&mut self) -> Result<()> {
         let report = self
             .audit_report
@@ -1017,6 +1068,7 @@ impl App {
             KeyCode::Char('R') => return self.mark_team_action(),
             KeyCode::Char('a') => return self.open_audit(),
             KeyCode::Char('A') => self.open_agents(),
+            KeyCode::Char('H') => return Ok(self.open_health()),
             KeyCode::Char('x') | KeyCode::Char('X') => self.toggle_message_fold(),
             KeyCode::Char('f') => self.toggle_fold_all(),
             KeyCode::Char('s') => self.jump_to_sender(),
@@ -1952,6 +2004,45 @@ impl App {
             _ => {}
         }
         Ok(AppAction::None)
+    }
+
+    fn handle_health_key(&mut self, key: KeyEvent) -> Result<AppAction> {
+        match key.code {
+            KeyCode::Char('q') => return Ok(AppAction::Quit),
+            KeyCode::Esc | KeyCode::Char('H') => self.screen = Screen::Main,
+            KeyCode::Char('j') | KeyCode::Down => {
+                let team_count = self
+                    .health_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.teams.len())
+                    .unwrap_or_default();
+                self.health_team_index =
+                    (self.health_team_index + 1).min(team_count.saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.health_team_index = self.health_team_index.saturating_sub(1);
+            }
+            KeyCode::Char('t') => {
+                self.health_window_days = if self.health_window_days == 7 { 30 } else { 7 };
+            }
+            KeyCode::Char('R') => return Ok(self.request_health_refresh()),
+            KeyCode::Char('?') => {
+                self.help_return_screen = Screen::Health;
+                self.help_scroll = 0;
+                self.screen = Screen::Help;
+            }
+            _ => {}
+        }
+        Ok(AppAction::None)
+    }
+
+    fn open_health(&mut self) -> AppAction {
+        self.screen = Screen::Health;
+        if self.health_snapshot.is_none() {
+            self.request_health_refresh()
+        } else {
+            AppAction::None
+        }
     }
 
     fn open_audit(&mut self) -> Result<AppAction> {

@@ -7,6 +7,7 @@ pub mod config;
 pub mod db;
 pub mod exec;
 pub mod highlight;
+pub mod health;
 pub mod notify;
 pub mod palette;
 pub mod poll;

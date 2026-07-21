@@ -1,6 +1,6 @@
 # agmsg-tui
 
-`agmsg` の team、member、room、送信、live tail、既読化、運用 audit、agent 管理をターミナル内で扱います。SQLite は常に read-only 接続し、全ての書き込みは agmsg script に委譲します。agent reset は `YES` 確認後に `reset.sh` を呼び、対象projectを保持するため `AGMSG_RESOLVE_PROJECT=0` をrunner側で常時付与します。
+`agmsg` の team、member、room、送信、live tail、既読化、運用 audit、Health & Trends、agent 管理をターミナル内で扱います。SQLite は常に read-only 接続し、全ての書き込みは agmsg script に委譲します。agent reset は `YES` 確認後に `reset.sh` を呼び、対象projectを保持するため `AGMSG_RESOLVE_PROJECT=0` をrunner側で常時付与します。
 
 ## Build and run
 
@@ -52,6 +52,10 @@ cargo build --release
 - `s`: 選択messageと同じsenderの直近messageへジャンプ
 - MEMBER: `Enter`で宛先指定composer、`I`でinfo、`F`でfilter、`M`で既読化
 - `Ctrl-A` / `a`: audit dashboard を開く
+- `H`: Health & Trends を開く（再度`H` / `Esc`でMainへ戻る、`q`は終了）
+- Health: `j`/`k`でteam選択、`t`で7d/30d切替、`R`で非同期refresh
+- Health: delivery mode、bridge生死（`●`全稼働 / `◐`一部 / `○`停止 / `-`なし）、最終message、stale unread、team/agent trafficを表示
+- Health: 表示中は60秒ごとにauto-refresh。幅60列未満ではteam表のsparkline列を省略
 - `A`: Agents管理画面を開く（再度`A` / `Esc` / `q`でMainへ戻る）
 - Agents: `t` / `Tab`でteam・identity focus、`n`でagent作成/join、`R`でrename
 - Agents: team focusの`T`でteam rename、`L`で現identityのteam離脱
@@ -67,7 +71,7 @@ cargo build --release
 - audit: `Enter`で詳細、`E`/`x`で`~/tmp/agmsg-report-<YYYYMMDD-HHMM>.md`へexport、`Ctrl-A`/`Tab`でmainへ戻る
 - audit: 表示中は60秒ごとに非同期auto-refresh（手動refreshとの重複実行を抑止）
 
-send/read/audit/agent管理の全scriptは10秒でtimeoutします。send/read実行中もpoll・描画・navigationは継続し、同じ操作の連打は抑止します。poll失敗時は1/2/4秒から最大30秒まで指数backoffし、回復をstatusへ表示します。
+send/read/audit/Health/agent管理の全subprocessは10秒でtimeoutします。send/read/Health実行中もpoll・描画・navigationは継続し、同じ操作の連打は抑止します。poll失敗時は1/2/4秒から最大30秒まで指数backoffし、回復をstatusへ表示します。
 
 tmux越しのOSC 52を使う場合は、tmux 3.3+で`set -g allow-passthrough on`を設定してください。
 
@@ -77,4 +81,4 @@ tmux越しのOSC 52を使う場合は、tmux 3.3+で`set -g allow-passthrough on
 
 ## Scope
 
-Phase 1〜9（旧Phase 8）として、audit dashboard、room可読性改善、syntax highlight、全DB検索、状態永続化、通知/burst alert、agent管理、subprocess非同期化・timeoutを実装しています。agent生成は既存`spawn.sh --no-wait`へ委譲し、TUI自体はPTYを管理しません。
+Phase 1〜11として、audit dashboard、Health & Trends、room可読性改善、syntax highlight、全DB検索、状態永続化、通知/burst alert、agent管理、subprocess非同期化・timeoutを実装しています。agent生成は既存`spawn.sh --no-wait`へ委譲し、TUI自体はPTYを管理しません。

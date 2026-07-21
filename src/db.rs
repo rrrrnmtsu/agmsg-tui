@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::Value;
@@ -12,6 +13,21 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 pub const ANALYTICS_WINDOW_DAYS: u32 = 30;
 pub const STALE_UNREAD_DAYS: u32 = 3;
 pub const PAIR_ASYMMETRY_TOLERANCE: f64 = 0.20;
+pub const DEFAULT_BURST_THRESHOLD: usize = 150;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DailyTraffic {
+    pub date: NaiveDate,
+    pub count: usize,
+    pub burst: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTraffic {
+    pub agent: String,
+    pub sent: usize,
+    pub received: usize,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
@@ -470,6 +486,91 @@ impl Database {
         Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
     }
 
+    pub fn latest_message_ts_per_team(&self) -> Result<BTreeMap<String, String>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT team, MAX(created_at) FROM messages GROUP BY team ORDER BY team",
+        )?;
+        Ok(statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?)
+    }
+
+    pub fn daily_traffic(&self, team: Option<&str>, days: u32) -> Result<Vec<DailyTraffic>> {
+        if days == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.connect()?;
+        let window = format!("-{} days", days.saturating_sub(1));
+        let mut statement = connection.prepare(
+            "SELECT date(created_at), COUNT(*)
+             FROM messages
+             WHERE (?1 IS NULL OR team = ?1)
+               AND date(created_at) BETWEEN date('now', ?2) AND date('now')
+             GROUP BY date(created_at)
+             ORDER BY date(created_at)",
+        )?;
+        let rows = statement.query_map(params![team, window], |row| {
+            let date: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((date, usize::try_from(count).unwrap_or_default()))
+        })?;
+        let counts = rows.collect::<rusqlite::Result<HashMap<_, _>>>()?;
+        let threshold = burst_threshold();
+        let today = Utc::now().date_naive();
+        Ok((0..days)
+            .rev()
+            .map(|offset| {
+                let date = today - ChronoDuration::days(i64::from(offset));
+                let count = counts
+                    .get(&date.format("%Y-%m-%d").to_string())
+                    .copied()
+                    .unwrap_or_default();
+                DailyTraffic {
+                    date,
+                    count,
+                    burst: count > threshold,
+                }
+            })
+            .collect())
+    }
+
+    pub fn agent_traffic(&self, team: &str, days: u32) -> Result<Vec<AgentTraffic>> {
+        if days == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.connect()?;
+        let window = format!("-{} days", days.saturating_sub(1));
+        let mut statement = connection.prepare(
+            "WITH traffic(agent, sent, received) AS (
+                 SELECT from_agent, 1, 0
+                 FROM messages
+                 WHERE team = ?1
+                   AND date(created_at) BETWEEN date('now', ?2) AND date('now')
+                 UNION ALL
+                 SELECT to_agent, 0, 1
+                 FROM messages
+                 WHERE team = ?1
+                   AND date(created_at) BETWEEN date('now', ?2) AND date('now')
+             )
+             SELECT agent, SUM(sent), SUM(received)
+             FROM traffic
+             GROUP BY agent
+             ORDER BY SUM(sent) + SUM(received) DESC, agent",
+        )?;
+        Ok(statement
+            .query_map(params![team, window], |row| {
+                let sent: i64 = row.get(1)?;
+                let received: i64 = row.get(2)?;
+                Ok(AgentTraffic {
+                    agent: row.get(0)?,
+                    sent: usize::try_from(sent).unwrap_or_default(),
+                    received: usize::try_from(received).unwrap_or_default(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn unread_recipients(&self, team: &str) -> Result<Vec<String>> {
         let connection = self.connect()?;
         let mut statement = connection.prepare(
@@ -650,6 +751,21 @@ impl Database {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    pub fn stale_unread_teams(&self, stale_days: u32) -> Result<BTreeSet<String>> {
+        let connection = self.connect()?;
+        let window = format!("-{stale_days} days");
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT team
+             FROM messages
+             WHERE read_at IS NULL
+               AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)
+             ORDER BY team",
+        )?;
+        Ok(statement
+            .query_map([window], |row| row.get(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?)
+    }
 }
 
 fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
@@ -669,4 +785,117 @@ fn escape_like_pattern(query: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+pub fn burst_threshold() -> usize {
+    std::env::var("AGMSG_BURST_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_BURST_THRESHOLD)
+}
+
+#[cfg(test)]
+mod health_traffic_tests {
+    use chrono::{Duration as ChronoDuration, Utc};
+    use rusqlite::{Connection, params};
+
+    use super::Database;
+
+    fn traffic_database() -> (tempfile::TempDir, Database) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("messages.db");
+        Connection::open(&path)
+            .expect("fixture db")
+            .execute_batch(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team TEXT NOT NULL,
+                    from_agent TEXT NOT NULL,
+                    to_agent TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    read_at TEXT
+                );",
+            )
+            .expect("schema");
+        (temp, Database::new(path))
+    }
+
+    #[test]
+    fn daily_traffic_zero_fills_and_flags_days_over_threshold() {
+        let (_temp, database) = traffic_database();
+        let connection = Connection::open(&database.path).expect("fixture writer");
+        let burst_day = (Utc::now().date_naive() - ChronoDuration::days(2))
+            .format("%Y-%m-%dT12:00:00Z")
+            .to_string();
+        let today = Utc::now()
+            .date_naive()
+            .format("%Y-%m-%dT12:00:00Z")
+            .to_string();
+        let transaction = connection.unchecked_transaction().expect("transaction");
+        for _ in 0..151 {
+            transaction
+                .execute(
+                    "INSERT INTO messages
+                     (team, from_agent, to_agent, body, created_at)
+                     VALUES ('ops', 'claude', 'codex', 'burst', ?1)",
+                    [&burst_day],
+                )
+                .expect("burst row");
+        }
+        transaction
+            .execute(
+                "INSERT INTO messages
+                 (team, from_agent, to_agent, body, created_at)
+                 VALUES ('ops', 'codex', 'claude', 'today', ?1)",
+                [&today],
+            )
+            .expect("today row");
+        transaction.commit().expect("commit fixture");
+
+        let traffic = database.daily_traffic(Some("ops"), 4).expect("traffic");
+        assert_eq!(traffic.len(), 4);
+        assert_eq!(
+            traffic.iter().map(|day| day.count).collect::<Vec<_>>(),
+            vec![0, 151, 0, 1]
+        );
+        assert_eq!(
+            traffic.iter().map(|day| day.burst).collect::<Vec<_>>(),
+            vec![false, true, false, false]
+        );
+    }
+
+    #[test]
+    fn agent_traffic_counts_both_directions() {
+        let (_temp, database) = traffic_database();
+        let connection = Connection::open(&database.path).expect("fixture writer");
+        let today = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        for (from, to) in [
+            ("claude", "codex"),
+            ("claude", "codex"),
+            ("codex", "claude"),
+            ("codex", "kimi"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO messages
+                     (team, from_agent, to_agent, body, created_at)
+                     VALUES ('ops', ?1, ?2, 'traffic', ?3)",
+                    params![from, to, today],
+                )
+                .expect("traffic row");
+        }
+
+        let traffic = database.agent_traffic("ops", 7).expect("agent traffic");
+        let claude = traffic
+            .iter()
+            .find(|row| row.agent == "claude")
+            .expect("claude");
+        let codex = traffic
+            .iter()
+            .find(|row| row.agent == "codex")
+            .expect("codex");
+        assert_eq!((claude.sent, claude.received), (2, 1));
+        assert_eq!((codex.sent, codex.received), (2, 2));
+    }
 }

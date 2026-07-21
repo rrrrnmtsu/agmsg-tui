@@ -255,7 +255,7 @@ fn render_room(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     let footer = Line::from(vec![
-        Span::raw("  [c][r:read-recipient][R][/][?:help]  "),
+        Span::raw("  [c][H:health][r:read-recipient][R][/][?:help]  "),
         Span::styled("details: ?", Style::default().fg(Color::DarkGray)),
     ]);
     lines.push(footer);
@@ -354,6 +354,7 @@ const HELP_LEFT: &[HelpSection] = &[
             ("Tab / S-Tab", "Focus next / previous pane"),
             ("Ctrl+A", "Toggle audit dashboard"),
             ("A", "Agents screen"),
+            ("H", "Health & trends screen"),
             ("Ctrl+N", "Notification settings"),
             ("Ctrl+B", "Mute / unmute terminal bell"),
             ("?", "Toggle this help"),
@@ -385,6 +386,17 @@ const HELP_LEFT: &[HelpSection] = &[
             ("n", "New agent (team default)"),
             ("R", "Rename selected member"),
             ("Esc", "Close info popup"),
+        ],
+    },
+    HelpSection {
+        title: "HEALTH",
+        entries: &[
+            ("H / Esc", "Back to main"),
+            ("j/k  ↑/↓", "Select team"),
+            ("t", "Toggle 7d / 30d window"),
+            ("R", "Refresh health"),
+            ("?", "Open this help"),
+            ("q", "Quit agmsg-tui"),
         ],
     },
 ];
