@@ -222,7 +222,22 @@ fn render_agents(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new("No team selected"), area);
         return;
     };
-    let traffic = team.agent_traffic(app.health_window_days);
+    let mut traffic = team.agent_traffic(app.health_window_days).to_vec();
+    for identity in &team.silent_identities {
+        if !traffic.iter().any(|row| row.agent == identity.agent) {
+            traffic.push(crate::db::AgentTraffic {
+                agent: identity.agent.clone(),
+                sent: 0,
+                received: 0,
+            });
+        }
+    }
+    traffic.sort_by_key(|row| {
+        !team
+            .silent_identities
+            .iter()
+            .any(|identity| identity.agent == row.agent)
+    });
     let max_total = traffic
         .iter()
         .map(|row| row.sent + row.received)
@@ -230,13 +245,73 @@ fn render_agents(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .unwrap_or(1)
         .max(1);
     let visible_rows = usize::from(area.height.saturating_sub(1));
+    if area.width < NARROW_WIDTH_THRESHOLD {
+        let rows = traffic.iter().take(visible_rows).map(|row| {
+            let silent = team
+                .silent_identities
+                .iter()
+                .any(|identity| identity.agent == row.agent);
+            let label = if silent {
+                format!(
+                    "{} ⚠ silent {} days",
+                    row.agent,
+                    app.health_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.silent_days)
+                        .unwrap_or_default()
+                )
+            } else {
+                format!("{}  s{}/r{}", row.agent, row.sent, row.received)
+            };
+            Row::new([Cell::from(label).style(if silent {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            })])
+        });
+        frame.render_widget(
+            Table::new(rows, [Constraint::Min(1)]).header(
+                Row::new([format!(
+                    "{} agents ({}d)",
+                    team.name, app.health_window_days
+                )])
+                .style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ),
+            area,
+        );
+        return;
+    }
     let rows = traffic.iter().take(visible_rows).map(|row| {
-        let bar_len = ((row.sent + row.received) * 12).div_ceil(max_total).max(1);
+        let total = row.sent + row.received;
+        let bar_len = if total == 0 {
+            0
+        } else {
+            (total * 12).div_ceil(max_total).max(1)
+        };
+        let silent = team
+            .silent_identities
+            .iter()
+            .any(|identity| identity.agent == row.agent);
         Row::new(vec![
             Cell::from(format!("  {}", row.agent)),
             Cell::from(format!("{:>5}", row.sent)),
             Cell::from(format!("{:>5}", row.received)),
-            Cell::from("▇".repeat(bar_len)),
+            if silent {
+                Cell::from(format!(
+                    "⚠ silent {} days",
+                    app.health_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.silent_days)
+                        .unwrap_or_default()
+                ))
+                .style(Style::default().fg(Color::Yellow))
+            } else {
+                Cell::from("▇".repeat(bar_len))
+            },
         ])
     });
     let header = Row::new(vec![

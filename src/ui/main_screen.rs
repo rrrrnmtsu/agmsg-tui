@@ -432,6 +432,8 @@ const HELP_RIGHT: &[HelpSection] = &[
     HelpSection {
         title: "AUDIT",
         entries: &[
+            ("D / H", "Dashboard/history"),
+            ("t", "Pair matrix 7d / 30d / 90d"),
             ("h/l  ←/→", "Switch team"),
             ("j/k  ↑/↓", "Select item"),
             ("g", "Jump to top"),

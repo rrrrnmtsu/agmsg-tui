@@ -7,14 +7,19 @@ use ratatui::widgets::{
     Wrap,
 };
 
-use crate::app::App;
+use crate::app::{App, AuditTab};
 use crate::audit::AXIS_ORDER;
+use crate::audit_history::detect_chatter_trend;
 use crate::db::PairMatrix;
 use crate::palette::{axis_score_color, overall_score_color};
 
 use super::main_screen::centered_rect;
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
+    if app.audit_tab == AuditTab::History {
+        super::audit_history::render(frame, app);
+        return;
+    }
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -40,10 +45,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 
 fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let title = app.audit_report.as_ref().map_or_else(
-        || " agmsg audit ".to_owned(),
+        || " agmsg audit | [D] DASHBOARD  H:HISTORY ".to_owned(),
         |report| {
             format!(
-                " agmsg audit | last {} | {}d / {} msgs / {} unread ",
+                " agmsg audit | [D] DASHBOARD  H:HISTORY | last {} | {}d / {} msgs / {} unread ",
                 compact_timestamp(&report.ts),
                 report.window_days,
                 report.total_msg,
@@ -128,7 +133,11 @@ fn render_axis_column(frame: &mut Frame<'_>, app: &App, area: Rect, names: &[&st
 fn render_pair_matrix(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(matrix) = app.current_pair_matrix() else {
         frame.render_widget(
-            Paragraph::new("No pair traffic in 30 days").block(
+            Paragraph::new(format!(
+                "No pair traffic in {} days",
+                app.audit_pair_window_days
+            ))
+            .block(
                 Block::default()
                     .title(" PAIR MATRIX ")
                     .borders(Borders::ALL),
@@ -138,7 +147,10 @@ fn render_pair_matrix(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     };
     let block = Block::default()
-        .title(" PAIR MATRIX 30d [h/l] ")
+        .title(format!(
+            " PAIR MATRIX {}d [h/l] [t:window] ",
+            app.audit_pair_window_days
+        ))
         .borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -255,12 +267,19 @@ fn render_items(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let status_text = if app.poll_offline && !app.status.text.starts_with("poll offline") {
+    let mut status_text = if app.poll_offline && !app.status.text.starts_with("poll offline") {
         format!("poll offline | {}", app.status.text)
     } else {
         app.status.text.clone()
     };
-    let style = if app.poll_offline || app.status.is_error {
+    let chatter_trend = detect_chatter_trend(&app.audit_history);
+    if let Some(trend) = chatter_trend {
+        status_text = format!(
+            "⚠ chatter loop trend: {}→{} pairs (7d) | {status_text}",
+            trend.start, trend.end
+        );
+    }
+    let style = if chatter_trend.is_some() || app.poll_offline || app.status.is_error {
         Style::default().fg(Color::Red)
     } else {
         Style::default().fg(Color::Green)
@@ -278,7 +297,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Paragraph::new(vec![
             Line::styled(status_text, style),
             Line::raw(
-                "Ctrl-A/Tab:main R:refresh j/k:item D:cmd B:bulk-reset W:bulk-rename M:read E:export",
+                "Ctrl-A/Tab:main D:dashboard/cmd H:history t:7/30/90d R:refresh j/k:item B/W/M/E",
             ),
         ]),
         area,

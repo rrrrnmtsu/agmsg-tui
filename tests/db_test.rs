@@ -375,3 +375,94 @@ fn stale_unreads_exclude_recent_and_read_messages() {
     assert_eq!(stale.len(), 1);
     assert_eq!(stale[0].id, stale_id);
 }
+
+#[test]
+fn body_size_distribution_respects_all_bucket_boundaries() {
+    let fixture = Fixture::new();
+    for length in [
+        0, 500, 501, 1_000, 1_001, 2_000, 2_001, 4_000, 4_001, 8_000, 8_001,
+    ] {
+        fixture.insert(
+            "ops",
+            "a",
+            "b",
+            &"x".repeat(length),
+            "2026-07-21T00:00:00Z",
+            None,
+        );
+    }
+    let distribution = fixture
+        .database()
+        .body_size_distribution()
+        .expect("distribution");
+    assert_eq!(distribution.buckets, [2, 2, 2, 2, 2, 1]);
+    assert_eq!(distribution.total, 11);
+    assert_eq!(distribution.p50, 2_000);
+    assert_eq!(distribution.p95, 8_001);
+    assert_eq!(distribution.p99, 8_001);
+}
+
+#[test]
+fn body_size_distribution_uses_nearest_rank_percentiles() {
+    let fixture = Fixture::new();
+    for length in 1..=100 {
+        fixture.insert(
+            "ops",
+            "a",
+            "b",
+            &"x".repeat(length),
+            "2026-07-21T00:00:00Z",
+            None,
+        );
+    }
+    let distribution = fixture
+        .database()
+        .body_size_distribution()
+        .expect("distribution");
+    assert_eq!(distribution.p50, 50);
+    assert_eq!(distribution.p95, 95);
+    assert_eq!(distribution.p99, 99);
+}
+
+#[test]
+fn silent_identities_are_registered_agents_without_recent_send() {
+    let fixture = Fixture::new();
+    fixture.add_team("ops", &["active", "receiver-only", "never-sent"]);
+    let broken_team = fixture.teams_dir.join("broken");
+    fs::create_dir_all(&broken_team).expect("broken team dir");
+    fs::write(broken_team.join("config.json"), "not json").expect("broken config");
+    fixture.insert(
+        "ops",
+        "active",
+        "receiver-only",
+        "recent",
+        "2999-01-01T00:00:00Z",
+        None,
+    );
+    fixture.insert(
+        "ops",
+        "receiver-only",
+        "active",
+        "old",
+        "2000-01-01T00:00:00Z",
+        None,
+    );
+    let silent = fixture
+        .database()
+        .silent_identities(&fixture.teams_dir, 3)
+        .expect("silent identities");
+    assert_eq!(
+        silent
+            .iter()
+            .map(|identity| identity.agent.as_str())
+            .collect::<Vec<_>>(),
+        vec!["never-sent", "receiver-only"]
+    );
+    assert!(
+        fixture
+            .database()
+            .silent_identities(&fixture.teams_dir, 0)
+            .expect("zero-day guard")
+            .is_empty()
+    );
+}

@@ -81,6 +81,16 @@ pub fn build_markdown(
     zombies: &[ZombieIdentity],
     stale_unreads: &[StaleUnread],
 ) -> String {
+    build_markdown_for_window(report, matrices, zombies, stale_unreads, 30)
+}
+
+pub fn build_markdown_for_window(
+    report: &AuditReport,
+    matrices: &[PairMatrix],
+    zombies: &[ZombieIdentity],
+    stale_unreads: &[StaleUnread],
+    pair_window_days: u32,
+) -> String {
     let mut output = format!(
         "# agmsg audit report\n\n- Generated: {}\n- Window: {} days\n- Total score: **{}/100**\n\n",
         report.ts, report.window_days, report.score
@@ -110,7 +120,7 @@ pub fn build_markdown(
         report.stale_run_files,
         report.max_team_pct
     ));
-    output.push_str("\n## Pair matrices (30 days)\n");
+    output.push_str(&format!("\n## Pair matrices ({pair_window_days} days)\n"));
     if matrices.is_empty() {
         output.push_str("\nNo pair traffic.\n");
     }

@@ -15,7 +15,8 @@ use crate::agents::{
     AgentFocus, AgentModal, AgentOperation, CLI_TYPES, SpawnModalState, SpawnStep,
     validate_agent_name, validate_team_name,
 };
-use crate::audit::{AuditReport, build_markdown, parse_audit_stdout, report_stamp};
+use crate::audit::{AuditReport, build_markdown_for_window, parse_audit_stdout, report_stamp};
+use crate::audit_history::{AuditHistorySample, read_audit_history};
 use crate::bulk::{
     BulkFilterFocus, BulkFilterState, BulkKind, BulkModal, BulkOperation, BulkRunState, BulkTarget,
     DespawnTarget, ExportFormat, LockStatus, RenameTarget, ResetTarget, actas_lock_status,
@@ -23,8 +24,9 @@ use crate::bulk::{
 };
 use crate::config::Paths;
 use crate::db::{
-    ANALYTICS_WINDOW_DAYS, AgentIdentitySummary, AgentTeamSummary, Database, MemberSummary,
-    Message, PairMatrix, STALE_UNREAD_DAYS, StaleUnread, TeamSummary, ZombieIdentity,
+    ANALYTICS_WINDOW_DAYS, AgentIdentitySummary, AgentTeamSummary, BodySizeDistribution, Database,
+    MemberSummary, Message, PairMatrix, STALE_UNREAD_DAYS, StaleUnread, TeamSummary,
+    ZombieIdentity,
 };
 use crate::exec::{CommandResult, reset_command_display};
 use crate::health::{HealthSnapshot, TeamHealth};
@@ -64,6 +66,12 @@ pub enum Screen {
     Health,
     BulkFilter,
     Help,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditTab {
+    Dashboard,
+    History,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,6 +253,10 @@ pub struct App {
     pub expanded_messages: HashMap<String, HashSet<i64>>,
     pub audit_report: Option<AuditReport>,
     pub audit_loading: bool,
+    pub audit_tab: AuditTab,
+    pub audit_pair_window_days: u32,
+    pub audit_history: Vec<AuditHistorySample>,
+    pub body_size_distribution: BodySizeDistribution,
     pub pair_matrices: Vec<PairMatrix>,
     pub zombies: Vec<ZombieIdentity>,
     pub stale_unreads: Vec<StaleUnread>,
@@ -353,6 +365,10 @@ impl App {
             expanded_messages: HashMap::new(),
             audit_report: None,
             audit_loading: false,
+            audit_tab: AuditTab::Dashboard,
+            audit_pair_window_days: ANALYTICS_WINDOW_DAYS,
+            audit_history: Vec::new(),
+            body_size_distribution: BodySizeDistribution::default(),
             pair_matrices: Vec::new(),
             zombies: Vec::new(),
             stale_unreads: Vec::new(),
@@ -819,6 +835,7 @@ impl App {
             return Ok(());
         }
         self.audit_report = Some(parse_audit_stdout(&result.stdout)?);
+        self.refresh_audit_insights()?;
         self.refresh_audit_analytics()?;
         self.audit_detail = None;
         self.status = StatusLine {
@@ -907,11 +924,12 @@ impl App {
                 self.paths.report_dir.display()
             )
         })?;
-        let markdown = build_markdown(
+        let markdown = build_markdown_for_window(
             report,
             &self.pair_matrices,
             &self.zombies,
             &self.stale_unreads,
+            self.audit_pair_window_days,
         );
         fs::write(&path, markdown)
             .with_context(|| format!("reportを書き込めません: {}", path.display()))?;
@@ -1998,6 +2016,27 @@ impl App {
             self.screen = Screen::Main;
             return Ok(AppAction::None);
         }
+        if key.code == KeyCode::Char('H') {
+            self.audit_tab = AuditTab::History;
+            return Ok(AppAction::None);
+        }
+        if self.audit_tab == AuditTab::History {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Tab => self.screen = Screen::Main,
+                KeyCode::Char('D') => self.audit_tab = AuditTab::Dashboard,
+                KeyCode::Char('R') | KeyCode::Char('a') => {
+                    return Ok(self.request_audit_refresh());
+                }
+                KeyCode::Char('E') | KeyCode::Char('x') => return Ok(AppAction::ExportReport),
+                KeyCode::Char('?') => {
+                    self.help_return_screen = Screen::Audit;
+                    self.help_scroll = 0;
+                    self.screen = Screen::Help;
+                }
+                _ => {}
+            }
+            return Ok(AppAction::None);
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Tab => self.screen = Screen::Main,
             KeyCode::Char('l') | KeyCode::Right => {
@@ -2017,6 +2056,7 @@ impl App {
             KeyCode::Char('R') | KeyCode::Char('a') => {
                 return Ok(self.request_audit_refresh());
             }
+            KeyCode::Char('t') => self.cycle_audit_pair_window()?,
             // M-2: `E` already exports to `report_dir` (default `~/tmp`);
             // `x` was in the requirements doc as a second export trigger and
             // was previously unbound. Aliasing it to the same action instead
@@ -2037,6 +2077,11 @@ impl App {
             KeyCode::Char('W') => self.open_bulk_rename_wizard(),
             KeyCode::Char('M') => return self.mark_stale_action(),
             KeyCode::Enter => self.show_audit_detail(),
+            KeyCode::Char('?') => {
+                self.help_return_screen = Screen::Audit;
+                self.help_scroll = 0;
+                self.screen = Screen::Help;
+            }
             _ => {}
         }
         Ok(AppAction::None)
@@ -2083,6 +2128,7 @@ impl App {
 
     fn open_audit(&mut self) -> Result<AppAction> {
         self.screen = Screen::Audit;
+        self.refresh_audit_insights()?;
         if self.audit_report.is_none() {
             Ok(self.request_audit_refresh())
         } else {
@@ -2745,7 +2791,7 @@ impl App {
     }
 
     fn refresh_audit_analytics(&mut self) -> Result<()> {
-        self.pair_matrices = self.database.pair_matrices(ANALYTICS_WINDOW_DAYS)?;
+        self.pair_matrices = self.database.pair_matrices(self.audit_pair_window_days)?;
         self.zombies = self
             .database
             .zombie_identities(&self.paths.teams_dir, ANALYTICS_WINDOW_DAYS)?;
@@ -2756,6 +2802,38 @@ impl App {
         self.audit_selected = self
             .audit_selected
             .min(self.audit_item_count().saturating_sub(1));
+        Ok(())
+    }
+
+    fn refresh_audit_insights(&mut self) -> Result<()> {
+        self.audit_history = read_audit_history(&self.paths.audit_history)?;
+        self.body_size_distribution = self.database.body_size_distribution()?;
+        Ok(())
+    }
+
+    fn cycle_audit_pair_window(&mut self) -> Result<()> {
+        let selected_team = self.current_pair_matrix().map(|matrix| matrix.team.clone());
+        self.audit_pair_window_days = match self.audit_pair_window_days {
+            7 => 30,
+            30 => 90,
+            _ => 7,
+        };
+        self.pair_matrices = self.database.pair_matrices(self.audit_pair_window_days)?;
+        self.audit_team_index = selected_team
+            .as_ref()
+            .and_then(|team| {
+                self.pair_matrices
+                    .iter()
+                    .position(|matrix| &matrix.team == team)
+            })
+            .unwrap_or_else(|| {
+                self.audit_team_index
+                    .min(self.pair_matrices.len().saturating_sub(1))
+            });
+        self.status = StatusLine {
+            text: format!("pair matrix window: {}d", self.audit_pair_window_days),
+            is_error: false,
+        };
         Ok(())
     }
 
@@ -3786,6 +3864,7 @@ mod tests {
             teams_dir,
             scripts_dir: temp.path().join("scripts"),
             audit_script: temp.path().join("agmsg-audit"),
+            audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
         })
@@ -3822,6 +3901,7 @@ mod tests {
             teams_dir,
             scripts_dir: temp.path().join("scripts"),
             audit_script: temp.path().join("agmsg-audit"),
+            audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
         })
@@ -4324,6 +4404,7 @@ mod tests {
             teams_dir,
             scripts_dir: temp.path().join("scripts"),
             audit_script: temp.path().join("agmsg-audit"),
+            audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
         })

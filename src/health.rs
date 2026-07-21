@@ -8,7 +8,10 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::task::JoinSet;
 
-use crate::db::{AgentTraffic, DailyTraffic, Database, STALE_UNREAD_DAYS, burst_threshold};
+use crate::db::{
+    AgentTraffic, DailyTraffic, Database, STALE_UNREAD_DAYS, SilentIdentity, burst_threshold,
+    silent_identity_days,
+};
 use crate::exec::ScriptRunner;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -54,6 +57,7 @@ pub struct TeamHealth {
     pub traffic_30d: Vec<DailyTraffic>,
     pub agents_7d: Vec<AgentTraffic>,
     pub agents_30d: Vec<AgentTraffic>,
+    pub silent_identities: Vec<SilentIdentity>,
 }
 
 impl TeamHealth {
@@ -81,6 +85,7 @@ pub struct HealthSnapshot {
     pub daily_total_30d: Vec<DailyTraffic>,
     pub refreshed_at: String,
     pub burst_threshold: usize,
+    pub silent_days: u32,
 }
 
 impl HealthSnapshot {
@@ -96,6 +101,7 @@ impl HealthSnapshot {
 #[derive(Clone, Debug)]
 struct Registration {
     team: String,
+    agent: String,
     agent_type: String,
     project: String,
 }
@@ -105,6 +111,7 @@ struct RawBridge {
     label: String,
     pid: u32,
     team_hint: Option<String>,
+    agent_hint: Option<String>,
     project_hint: Option<String>,
 }
 
@@ -160,6 +167,11 @@ pub async fn collect_health_snapshot(
         .unwrap_or_default();
     let mut bridges_by_team =
         map_bridges_to_teams(&raw_bridges, &registrations, &team_names, &alive);
+    let alive_by_identity = bridge_alive_map(&raw_bridges, &registrations, &alive);
+    let silent_days = silent_identity_days();
+    let silent_candidates = database
+        .silent_identities(teams_dir, silent_days)
+        .unwrap_or_default();
 
     let now = Utc::now();
     let mut teams = Vec::with_capacity(team_names.len());
@@ -177,6 +189,17 @@ pub async fn collect_health_snapshot(
         let traffic_30d = database.daily_traffic(Some(&name), 30).unwrap_or_default();
         let agents_7d = database.agent_traffic(&name, 7).unwrap_or_default();
         let agents_30d = database.agent_traffic(&name, 30).unwrap_or_default();
+        let silent_identities = silent_candidates
+            .iter()
+            .filter(|identity| {
+                identity.team == name
+                    && alive_by_identity
+                        .get(&(identity.team.clone(), identity.agent.clone()))
+                        .copied()
+                        .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
         teams.push(TeamHealth {
             orphan: !teams_dir.join(&name).is_dir(),
             delivery: delivery_modes
@@ -191,6 +214,7 @@ pub async fn collect_health_snapshot(
             traffic_30d,
             agents_7d,
             agents_30d,
+            silent_identities,
             name,
         });
     }
@@ -201,6 +225,7 @@ pub async fn collect_health_snapshot(
         daily_total_30d: database.daily_traffic(None, 30).unwrap_or_default(),
         refreshed_at: now.format("%H:%M:%S").to_string(),
         burst_threshold: burst_threshold(),
+        silent_days,
     })
 }
 
@@ -271,7 +296,7 @@ fn load_registrations(teams_dir: &Path, team_names: &[String]) -> Vec<Registrati
         let Some(agents) = config.get("agents").and_then(Value::as_object) else {
             continue;
         };
-        for agent in agents.values() {
+        for (name, agent) in agents {
             let Some(items) = agent.get("registrations").and_then(Value::as_array) else {
                 continue;
             };
@@ -284,6 +309,7 @@ fn load_registrations(teams_dir: &Path, team_names: &[String]) -> Vec<Registrati
                 };
                 registrations.push(Registration {
                     team: team.clone(),
+                    agent: name.clone(),
                     agent_type: agent_type.to_owned(),
                     project: project.to_owned(),
                 });
@@ -314,6 +340,7 @@ fn discover_bridges(run_dir: &Path) -> Vec<RawBridge> {
                 label: "claude-code".to_owned(),
                 pid,
                 team_hint: None,
+                agent_hint: None,
                 project_hint: read_project_marker(run_dir, pid),
             })
         } else if let Some(stem) = name.strip_suffix(".pid") {
@@ -337,6 +364,7 @@ fn discover_bridges(run_dir: &Path) -> Vec<RawBridge> {
 
 fn raw_bridge_from_pidfile(run_dir: &Path, stem: &str, pid: u32) -> RawBridge {
     let mut team_hint = None;
+    let mut agent_hint = None;
     let mut project_hint = None;
     let mut label = stem.split('.').next().unwrap_or("bridge").to_owned();
 
@@ -344,6 +372,7 @@ fn raw_bridge_from_pidfile(run_dir: &Path, stem: &str, pid: u32) -> RawBridge {
         && let Some((team, agent)) = identity.rsplit_once('.')
     {
         team_hint = Some(team.to_owned());
+        agent_hint = Some(agent.to_owned());
         label = format!("codex/{agent}");
     }
     if let Some(owner_pid) = stem
@@ -356,6 +385,7 @@ fn raw_bridge_from_pidfile(run_dir: &Path, stem: &str, pid: u32) -> RawBridge {
 
     let metadata = read_key_values(&run_dir.join(format!("{stem}.meta")));
     team_hint = metadata.get("team").cloned().or(team_hint);
+    agent_hint = metadata.get("agent").cloned().or(agent_hint);
     project_hint = metadata.get("project").cloned().or(project_hint);
     if let Some(name) = metadata.get("name") {
         label = format!("{label}/{name}");
@@ -363,12 +393,71 @@ fn raw_bridge_from_pidfile(run_dir: &Path, stem: &str, pid: u32) -> RawBridge {
     if project_hint.is_none() {
         project_hint = read_project_from_log(&run_dir.join(format!("{stem}.log")));
     }
+    if let Some(role_agent) = role_session_agent_hint(
+        run_dir,
+        team_hint.as_deref(),
+        bridge_agent_type(&label),
+        project_hint.as_deref(),
+    ) {
+        agent_hint = Some(role_agent);
+    }
 
     RawBridge {
         label,
         pid,
         team_hint,
+        agent_hint,
         project_hint,
+    }
+}
+
+/// codex bridgeのpid名は汎用名になることがあるため、role-session markerから
+/// 実際の登録identityを一意に復元する。
+fn role_session_agent_hint(
+    run_dir: &Path,
+    team_hint: Option<&str>,
+    agent_type: Option<&str>,
+    project_hint: Option<&str>,
+) -> Option<String> {
+    let team_hint = team_hint?;
+    let agent_type = agent_type?;
+    let mut agents = BTreeSet::new();
+    let entries = fs::read_dir(run_dir).ok()?;
+    for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+        let is_role_session = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("role-session."));
+        if !is_role_session {
+            continue;
+        }
+        let metadata = read_key_values(&path);
+        if metadata.get("team").map(String::as_str) != Some(team_hint)
+            || metadata.get("type").map(String::as_str) != Some(agent_type)
+            || project_hint.is_some_and(|project| {
+                metadata.get("project").map(String::as_str) != Some(project)
+            })
+        {
+            continue;
+        }
+        if let Some(agent) = metadata.get("agent") {
+            agents.insert(agent.clone());
+        }
+    }
+    (agents.len() == 1).then(|| agents.into_iter().next()).flatten()
+}
+
+fn bridge_agent_type(label: &str) -> Option<&'static str> {
+    if label.starts_with("claude-code") {
+        Some("claude-code")
+    } else if label.starts_with("cursor-bridge") {
+        Some("cursor")
+    } else if label.starts_with("kimi-bridge") {
+        Some("kimi")
+    } else if label.starts_with("codex") {
+        Some("codex")
+    } else {
+        None
     }
 }
 
@@ -413,6 +502,9 @@ fn merge_bridge_hints(existing: &mut RawBridge, candidate: &RawBridge) {
     if existing.project_hint.is_none() {
         existing.project_hint.clone_from(&candidate.project_hint);
     }
+    if existing.agent_hint.is_none() {
+        existing.agent_hint.clone_from(&candidate.agent_hint);
+    }
     if existing.label == "bridge" {
         existing.label.clone_from(&candidate.label);
     }
@@ -456,6 +548,58 @@ fn map_bridges_to_teams(
     mapped
 }
 
+/// P11のbridge解決結果をidentity単位へ投影する。identity名を持つbridgeは
+/// exact matchし、名前を持たないbridgeは一意なtype/projectだけ照合する。
+fn bridge_alive_map(
+    raw_bridges: &[RawBridge],
+    registrations: &[Registration],
+    alive: &BTreeSet<u32>,
+) -> BTreeMap<(String, String), bool> {
+    let mut identities_by_registration =
+        BTreeMap::<(String, String), BTreeSet<(String, String)>>::new();
+    for registration in registrations {
+        identities_by_registration
+            .entry((
+                registration.agent_type.clone(),
+                registration.project.clone(),
+            ))
+            .or_default()
+            .insert((registration.team.clone(), registration.agent.clone()));
+    }
+    let mut mapped = BTreeMap::new();
+    for registration in registrations {
+        let is_alive = raw_bridges.iter().any(|bridge| {
+            if !alive.contains(&bridge.pid)
+                || !bridge_kind_matches(&bridge.label, &registration.agent_type)
+            {
+                return false;
+            }
+            if let Some(team) = &bridge.team_hint
+                && team != &registration.team
+            {
+                return false;
+            }
+            if let Some(agent_hint) = &bridge.agent_hint {
+                return agent_hint == &registration.agent;
+            }
+            let identity = (registration.team.clone(), registration.agent.clone());
+            bridge.project_hint.as_ref().is_some_and(|project| {
+                project == &registration.project
+                    && identities_by_registration
+                        .get(&(registration.agent_type.clone(), project.clone()))
+                        .is_some_and(|identities| {
+                            identities.len() == 1 && identities.contains(&identity)
+                        })
+            })
+        });
+        mapped
+            .entry((registration.team.clone(), registration.agent.clone()))
+            .and_modify(|alive| *alive |= is_alive)
+            .or_insert(is_alive);
+    }
+    mapped
+}
+
 fn bridge_kind_matches(label: &str, agent_type: &str) -> bool {
     if label.starts_with("claude-code") {
         agent_type == "claude-code"
@@ -472,9 +616,13 @@ fn bridge_kind_matches(label: &str, agent_type: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
 
-    use super::{DeliveryMode, discover_bridges, parse_alive_pids, parse_delivery_mode};
+    use super::{
+        DeliveryMode, RawBridge, Registration, bridge_alive_map, discover_bridges,
+        parse_alive_pids, parse_delivery_mode,
+    };
     use crate::exec::ScriptRunner;
 
     #[tokio::test(flavor = "current_thread")]
@@ -524,5 +672,102 @@ mod tests {
         assert!(alive.contains(&123));
         assert!(alive.contains(&456));
         assert!(!alive.contains(&789));
+    }
+
+    #[test]
+    fn bridge_alive_map_prefers_identity_hint_and_falls_back_to_project_type() {
+        let registrations = vec![
+            Registration {
+                team: "ops".to_owned(),
+                agent: "codex-worker".to_owned(),
+                agent_type: "codex".to_owned(),
+                project: "/repo/ops".to_owned(),
+            },
+            Registration {
+                team: "ops".to_owned(),
+                agent: "claude-main".to_owned(),
+                agent_type: "claude-code".to_owned(),
+                project: "/repo/ops".to_owned(),
+            },
+        ];
+        let bridges = vec![
+            RawBridge {
+                label: "codex/codex-worker".to_owned(),
+                pid: 10,
+                team_hint: Some("ops".to_owned()),
+                agent_hint: Some("codex-worker".to_owned()),
+                project_hint: None,
+            },
+            RawBridge {
+                label: "claude-code".to_owned(),
+                pid: 20,
+                team_hint: None,
+                agent_hint: None,
+                project_hint: Some("/repo/ops".to_owned()),
+            },
+        ];
+        let alive = BTreeSet::from([10, 20]);
+        let map = bridge_alive_map(&bridges, &registrations, &alive);
+        assert_eq!(
+            map.get(&("ops".to_owned(), "codex-worker".to_owned())),
+            Some(&true)
+        );
+        assert_eq!(
+            map.get(&("ops".to_owned(), "claude-main".to_owned())),
+            Some(&true)
+        );
+    }
+
+    #[test]
+    fn project_fallback_requires_a_unique_registered_identity() {
+        let registrations = vec![
+            Registration {
+                team: "one".to_owned(),
+                agent: "claude-one".to_owned(),
+                agent_type: "claude-code".to_owned(),
+                project: "/repo/shared".to_owned(),
+            },
+            Registration {
+                team: "two".to_owned(),
+                agent: "claude-two".to_owned(),
+                agent_type: "claude-code".to_owned(),
+                project: "/repo/shared".to_owned(),
+            },
+        ];
+        let bridges = vec![RawBridge {
+            label: "claude-code".to_owned(),
+            pid: 20,
+            team_hint: None,
+            agent_hint: None,
+            project_hint: Some("/repo/shared".to_owned()),
+        }];
+        let map = bridge_alive_map(&bridges, &registrations, &BTreeSet::from([20]));
+        assert!(map.values().all(|alive| !alive));
+    }
+
+    #[test]
+    fn codex_role_session_marker_overrides_generic_pid_identity() {
+        let temp = tempfile::tempdir().expect("fixture dir");
+        fs::write(
+            temp.path().join("codex-bridge.ops.codex.pid"),
+            "789\n",
+        )
+        .expect("pid fixture");
+        fs::write(
+            temp.path().join("codex-bridge.ops.codex.meta"),
+            "team=ops\nproject=/repo/ops\n",
+        )
+        .expect("meta fixture");
+        fs::write(
+            temp.path().join("role-session.ops__codex-worker"),
+            "team=ops\nagent=codex-worker\ntype=codex\nproject=/repo/ops\n",
+        )
+        .expect("role fixture");
+
+        let bridge = discover_bridges(temp.path())
+            .into_iter()
+            .find(|bridge| bridge.pid == 789)
+            .expect("bridge");
+        assert_eq!(bridge.agent_hint.as_deref(), Some("codex-worker"));
     }
 }

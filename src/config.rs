@@ -30,6 +30,10 @@ pub struct Cli {
     #[arg(long)]
     pub audit_script: Option<PathBuf>,
 
+    /// agmsg-audit の累積JSONLパス
+    #[arg(long)]
+    pub audit_history: Option<PathBuf>,
+
     /// Markdown report の保存先
     #[arg(long)]
     pub report_dir: Option<PathBuf>,
@@ -90,6 +94,7 @@ pub struct Paths {
     pub teams_dir: PathBuf,
     pub scripts_dir: PathBuf,
     pub audit_script: PathBuf,
+    pub audit_history: PathBuf,
     pub report_dir: PathBuf,
     pub state_file: PathBuf,
 }
@@ -122,6 +127,11 @@ impl Paths {
                 .clone()
                 .or_else(|| env::var_os("AGMSG_AUDIT").map(PathBuf::from))
                 .unwrap_or_else(|| home.join("bin/agmsg-audit")),
+            audit_history: cli
+                .audit_history
+                .clone()
+                .or_else(|| env::var_os("AGMSG_AUDIT_HISTORY").map(PathBuf::from))
+                .unwrap_or_else(|| home.join(".claude/metrics/agmsg-audit.jsonl")),
             report_dir: cli
                 .report_dir
                 .clone()

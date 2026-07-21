@@ -39,6 +39,7 @@ fn fixture_app() -> (TempDir, App) {
         teams_dir,
         scripts_dir: temp.path().join("scripts"),
         audit_script: temp.path().join("agmsg-audit"),
+        audit_history: temp.path().join("audit.jsonl"),
         report_dir: temp.path().join("reports"),
         state_file: temp.path().join("state.json"),
     })

@@ -1,4 +1,5 @@
 mod audit;
+mod audit_history;
 mod agents;
 mod bulk_filter;
 mod bulk_preview;
@@ -148,6 +149,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         }
         Screen::Help => {
             match app.help_return_screen {
+                Screen::Audit => audit::render(frame, app),
                 Screen::Agents => agents::render(frame, app),
                 Screen::Health => health::render(frame, app),
                 Screen::BulkFilter => bulk_filter::render(frame, app),
@@ -180,16 +182,17 @@ mod tests {
         backend::{Backend, TestBackend},
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use chrono::{Duration as ChronoDuration, Utc};
     use rusqlite::Connection;
     use tempfile::{TempDir, tempdir};
 
     use super::render;
-    use crate::app::{App, AppAction, Screen};
+    use crate::app::{App, AppAction, AuditTab, Screen};
     use crate::bulk::{
         BulkKind, BulkModal, BulkOperation, BulkTarget, MarkReadTarget, ResetTarget,
     };
     use crate::config::Paths;
-    use crate::db::{AgentTraffic, DailyTraffic};
+    use crate::db::{AgentTraffic, DailyTraffic, SilentIdentity};
     use crate::exec::CommandResult;
     use crate::health::{
         BridgeStatus, DeliveryMode, HealthSnapshot, TeamHealth,
@@ -232,6 +235,7 @@ mod tests {
             teams_dir,
             scripts_dir: temp.path().join("scripts"),
             audit_script: temp.path().join("agmsg-audit"),
+            audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
         })
@@ -292,6 +296,10 @@ mod tests {
                 },
             ],
             agents_30d: Vec::new(),
+            silent_identities: vec![SilentIdentity {
+                team: "ops-hub".to_owned(),
+                agent: "quiet-agent".to_owned(),
+            }],
         };
         let orphan = TeamHealth {
             name: "old-team".to_owned(),
@@ -309,6 +317,7 @@ mod tests {
             traffic_30d: Vec::new(),
             agents_7d: Vec::new(),
             agents_30d: Vec::new(),
+            silent_identities: Vec::new(),
         };
         HealthSnapshot {
             teams: vec![ops, orphan],
@@ -316,6 +325,7 @@ mod tests {
             daily_total_30d: traffic,
             refreshed_at: "12:04:31".to_owned(),
             burst_threshold: 150,
+            silent_days: 3,
         }
     }
 
@@ -349,6 +359,7 @@ mod tests {
             teams_dir,
             scripts_dir: temp.path().join("scripts"),
             audit_script: temp.path().join("agmsg-audit"),
+            audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
         })
@@ -396,6 +407,7 @@ mod tests {
             teams_dir,
             scripts_dir: temp.path().join("scripts"),
             audit_script: temp.path().join("agmsg-audit"),
+            audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
         })
@@ -444,6 +456,7 @@ mod tests {
             teams_dir,
             scripts_dir: temp.path().join("scripts"),
             audit_script: temp.path().join("agmsg-audit"),
+            audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
         })
@@ -461,6 +474,13 @@ mod tests {
         }
         assert!(snapshot.contains("Main Esc=clear only | q=quit"));
         assert!(snapshot.contains("agmsg-tui — Keybindings"));
+        app.help_scroll = 8;
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("draw audit help");
+        let audit_help = terminal.backend().to_string();
+        assert!(audit_help.contains("Dashboard/history"));
+        assert!(audit_help.contains("Pair matrix 7d"));
         app.help_scroll = u16::MAX;
         terminal
             .draw(|frame| render(frame, &app))
@@ -498,6 +518,7 @@ mod tests {
             teams_dir,
             scripts_dir: temp.path().join("scripts"),
             audit_script: temp.path().join("agmsg-audit"),
+            audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
         })
@@ -563,11 +584,27 @@ mod tests {
             r#"{"agents":{"codex-worker":{},"claude-main":{}}}"#,
         )
         .expect("config");
+        let now = Utc::now();
+        fs::write(
+            temp.path().join("audit.jsonl"),
+            format!(
+                concat!(
+                    "{{\"ts\":\"{}\",\"score\":78,\"msg\":700,\"unread\":9,\"body_p95\":1800,\"asym\":1,\"zombies\":0}}\n",
+                    "{{\"ts\":\"{}\",\"score\":80,\"total_msg\":720,\"unread\":8,\"body_p95\":1700,\"asymmetric_pairs\":2,\"zombie_identities\":0}}\n",
+                    "{{\"ts\":\"{}\",\"score\":83,\"total_msg\":740,\"unread\":7,\"body_p95\":1600,\"asymmetric_pairs\":4,\"zombie_identities\":1}}\n"
+                ),
+                (now - ChronoDuration::days(2)).to_rfc3339(),
+                (now - ChronoDuration::days(1)).to_rfc3339(),
+                now.to_rfc3339(),
+            ),
+        )
+        .expect("audit history");
         let mut app = App::load(Paths {
             db: db_path,
             teams_dir,
             scripts_dir: temp.path().join("scripts"),
             audit_script: temp.path().join("agmsg-audit"),
+            audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
         })
@@ -596,6 +633,53 @@ mod tests {
         assert!(snapshot.contains("10 AXES"));
         assert!(snapshot.contains("PAIR MATRIX 30d"));
         assert!(snapshot.contains("ACTIONS Z:"));
+        assert!(snapshot.contains("chatter loop trend: 1→4 pairs (7d)"));
+
+        for expected in [90, 7, 30] {
+            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+                .expect("cycle pair window");
+            assert_eq!(app.audit_pair_window_days, expected);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE))
+            .expect("history tab");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("draw history");
+        let history = terminal.backend().to_string();
+        for needle in [
+            "[H] HISTORY",
+            "3 samples",
+            "score",
+            "total_msg",
+            "body_p95",
+            "BODY SIZE",
+            "p50 5",
+            "chatter loop trend: 1→4 pairs (7d)",
+        ] {
+            assert!(
+                history.contains(needle),
+                "history snapshot missing {needle}"
+            );
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE))
+            .expect("dashboard tab");
+        assert_eq!(app.audit_tab, AuditTab::Dashboard);
+    }
+
+    #[test]
+    fn audit_history_narrow_snapshot_shows_insufficient_state_and_histogram() {
+        let (_temp, mut app) = agents_fixture();
+        app.screen = Screen::Audit;
+        app.audit_tab = AuditTab::History;
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("draw narrow history");
+        let snapshot = terminal.backend().to_string();
+        assert!(snapshot.contains("insufficient history"));
+        assert!(snapshot.contains("BODY SIZE"));
+        assert!(snapshot.contains("0-500"));
     }
 
     #[test]
@@ -696,6 +780,8 @@ mod tests {
             "(orphan) old",
             "6 !",
             "ops-hub agents (7d)",
+            "quiet-agent",
+            "⚠ silent 3 days",
             "daily total (7d)",
             "burst>150: none",
         ] {
@@ -728,7 +814,14 @@ mod tests {
             .draw(|frame| render(frame, &app))
             .expect("draw narrow health");
         let snapshot = terminal.backend().to_string();
-        for needle in ["TEAM", "MODE", "BRIDGE", "UNREAD", "ops-hub"] {
+        for needle in [
+            "TEAM",
+            "MODE",
+            "BRIDGE",
+            "UNREAD",
+            "ops-hub",
+            "⚠ silent 3 days",
+        ] {
             assert!(snapshot.contains(needle), "narrow snapshot missing {needle}");
         }
         assert!(!snapshot.contains("LAST MSG"));

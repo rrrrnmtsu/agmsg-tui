@@ -14,6 +14,15 @@ pub const ANALYTICS_WINDOW_DAYS: u32 = 30;
 pub const STALE_UNREAD_DAYS: u32 = 3;
 pub const PAIR_ASYMMETRY_TOLERANCE: f64 = 0.20;
 pub const DEFAULT_BURST_THRESHOLD: usize = 150;
+pub const SILENT_IDENTITY_DAYS: u32 = 3;
+pub const BODY_SIZE_BUCKET_LABELS: [&str; 6] = [
+    "0-500",
+    "500-1000",
+    "1000-2000",
+    "2000-4000",
+    "4000-8000",
+    ">8000",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DailyTraffic {
@@ -99,6 +108,21 @@ pub struct StaleUnread {
     pub to_agent: String,
     pub body: String,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BodySizeDistribution {
+    pub buckets: [usize; 6],
+    pub total: usize,
+    pub p50: usize,
+    pub p95: usize,
+    pub p99: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SilentIdentity {
+    pub team: String,
+    pub agent: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -662,6 +686,80 @@ impl Database {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// 全messageの本文文字数分布。audit CLI の `LENGTH(body)` と同じ
+    /// 単位を使い、HISTORY上の body_p95 と比較可能に保つ。
+    pub fn body_size_distribution(&self) -> Result<BodySizeDistribution> {
+        let connection = self.connect()?;
+        let mut statement =
+            connection.prepare("SELECT LENGTH(body) FROM messages ORDER BY LENGTH(body)")?;
+        let lengths = statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .filter_map(|length| length.ok().and_then(|length| usize::try_from(length).ok()))
+            .collect::<Vec<_>>();
+        if lengths.is_empty() {
+            return Ok(BodySizeDistribution::default());
+        }
+        let mut buckets = [0; 6];
+        for length in &lengths {
+            let index = match length {
+                0..=500 => 0,
+                501..=1_000 => 1,
+                1_001..=2_000 => 2,
+                2_001..=4_000 => 3,
+                4_001..=8_000 => 4,
+                _ => 5,
+            };
+            buckets[index] += 1;
+        }
+        Ok(BodySizeDistribution {
+            buckets,
+            total: lengths.len(),
+            p50: percentile_nearest_rank(&lengths, 50),
+            p95: percentile_nearest_rank(&lengths, 95),
+            p99: percentile_nearest_rank(&lengths, 99),
+        })
+    }
+
+    /// config登録済みで、指定期間にsendが0件のidentity候補を返す。
+    /// bridge生死との積集合はhealth収集層で行う。
+    pub fn silent_identities(
+        &self,
+        teams_dir: &Path,
+        window_days: u32,
+    ) -> Result<Vec<SilentIdentity>> {
+        if window_days == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.connect()?;
+        let window = format!("-{window_days} days");
+        let mut statement = connection.prepare(
+            "SELECT EXISTS(
+                 SELECT 1 FROM messages
+                 WHERE team = ?1 AND from_agent = ?2
+                   AND created_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?3)
+             )",
+        )?;
+        let mut silent = Vec::new();
+        for team in self.team_names(teams_dir)? {
+            let roster = match Self::load_roster(teams_dir, &team) {
+                Ok(roster) => roster,
+                Err(_) => continue,
+            };
+            for agent in roster {
+                let sent: bool = statement.query_row(params![team, agent, window], |row| {
+                    row.get::<_, i64>(0).map(|value| value != 0)
+                })?;
+                if !sent {
+                    silent.push(SilentIdentity {
+                        team: team.clone(),
+                        agent,
+                    });
+                }
+            }
+        }
+        Ok(silent)
+    }
+
     pub fn message_by_id(&self, id: i64) -> Result<Option<Message>> {
         let connection = self.connect()?;
         Ok(connection
@@ -801,11 +899,27 @@ fn escape_like_pattern(query: &str) -> String {
         .replace('_', "\\_")
 }
 
+fn percentile_nearest_rank(sorted: &[usize], percentile: usize) -> usize {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (percentile * sorted.len()).div_ceil(100).max(1);
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
 pub fn burst_threshold() -> usize {
     std::env::var("AGMSG_BURST_THRESHOLD")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_BURST_THRESHOLD)
+}
+
+pub fn silent_identity_days() -> u32 {
+    std::env::var("AGMSG_SILENT_DAYS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(SILENT_IDENTITY_DAYS)
 }
 
 #[cfg(test)]

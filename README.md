@@ -15,6 +15,7 @@ cargo build --release
 - teams: `~/.agents/skills/agmsg/teams` (`--teams-dir` / `AGMSG_TEAMS_DIR`)
 - scripts: `~/.agents/skills/agmsg/scripts` (`--scripts-dir` / `AGMSG_SCRIPTS_DIR`)
 - audit: `~/bin/agmsg-audit` (`--audit-script` / `AGMSG_AUDIT`)
+- audit history: `~/.claude/metrics/agmsg-audit.jsonl` (`--audit-history` / `AGMSG_AUDIT_HISTORY`)
 - reports: `~/tmp` (`--report-dir` / `AGMSG_REPORT_DIR`)
 - UI state: `~/.config/agmsg-tui/state.json`（sidebar幅、last team、team別draft、通知toggle）
 - identity: `AGMSG_IDENTITY`（CLI optionなし、env変数のみ）— 未設定でも起動はできますが、以下がすべて無効化されます:
@@ -58,6 +59,7 @@ cargo build --release
 - `H`: Health & Trends を開く（再度`H` / `Esc`でMainへ戻る、`q`は終了）
 - Health: `j`/`k`でteam選択、`t`で7d/30d切替、`R`で非同期refresh
 - Health: delivery mode、bridge生死（`●`全稼働 / `◐`一部 / `○`停止 / `-`なし）、最終message、stale unread、team/agent trafficを表示
+- Health: 登録済み・bridge稼働中なのに送信0のidentityへ `⚠ silent N days` を表示（`AGMSG_SILENT_DAYS`、default 3）
 - Health: 表示中は60秒ごとにauto-refresh。幅60列未満ではteam表のsparkline列を省略
 - `A`: Agents管理画面を開く（再度`A` / `Esc` / `q`でMainへ戻る）
 - Agents: `t` / `Tab`でteam・identity focus、`n`でagent作成/join、`R`でrename
@@ -70,7 +72,9 @@ cargo build --release
 - `q`: 即時終了。Mainの`Esc`はsearch/filter/popupの解除専用
 - composer: `Tab`でfrom、`Shift-Tab`でtoを切替、`Ctrl-S`で非同期送信、`Esc`でteam別下書き保存、`Ctrl-K`で下書き消去
 - composer: 2048B超で黄、4096B超で赤の警告（4096B超は送信をblock）
-- audit: `R`でrefresh、`h`/`l`でteam matrix切替、`j`/`k`でaction選択、`g`で選択先頭へジャンプ
+- audit: `D`でdashboard、`H`でHISTORY tab。dashboardの`D`は従来どおり選択zombieのreset command表示
+- audit: `t`でpair matrixを7d/30d/90d切替、`R`でrefresh、`h`/`l`でteam matrix切替、`j`/`k`でaction選択、`g`で選択先頭へジャンプ
+- audit HISTORY: `~/.claude/metrics/agmsg-audit.jsonl`直近30 samples/30日からscore・message数・unread・body p95・zombieを時系列表示。7日chatter loop trendと全bodyのbucket/p50/p95/p99も表示
 - audit: `D`でzombie reset command表示、`M`でstale unreadを`inbox.sh`経由で既読化
 - audit: `B`でstale/zombie identityの一括reset、`W`で匿名/連番identityの提案名編集・一括rename。いずれもpreview → `YES` → 逐次実行
 - audit: `Enter`で詳細、`E`/`x`で`~/tmp/agmsg-report-<YYYYMMDD-HHMM>.md`へexport、`Ctrl-A`/`Tab`でmainへ戻る
@@ -86,4 +90,4 @@ tmux越しのOSC 52を使う場合は、tmux 3.3+で`set -g allow-passthrough on
 
 ## Scope
 
-Phase 1〜12として、audit dashboard、Health & Trends、cross-team filter/export/bulk action、room可読性改善、syntax highlight、全DB検索、状態永続化、通知/burst alert、agent管理、subprocess非同期化・timeoutを実装しています。bulk actionは対象全件previewとbatch単位の`YES`確認後に逐次script委譲し、失敗時はcontinue/abort、実行中は`Esc`でcancel channel経由のcurrent command中断を選べます。agent生成は既存`spawn.sh --no-wait`へ委譲し、TUI自体はPTYを管理しません。
+Phase 1〜13として、audit dashboard/HISTORY/anomaly、Health & Trends、cross-team filter/export/bulk action、room可読性改善、syntax highlight、全DB検索、状態永続化、通知/burst alert、agent管理、subprocess非同期化・timeoutを実装しています。bulk actionは対象全件previewとbatch単位の`YES`確認後に逐次script委譲し、失敗時はcontinue/abort、実行中は`Esc`でcancel channel経由のcurrent command中断を選べます。agent生成は既存`spawn.sh --no-wait`へ委譲し、TUI自体はPTYを管理しません。
