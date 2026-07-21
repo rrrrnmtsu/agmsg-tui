@@ -255,7 +255,21 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         Style::default().fg(Color::Green)
     };
-    frame.render_widget(Paragraph::new(app.status.text.as_str()).style(style), area);
+    // Phase 14E: the HISTORY tab had no per-row selection before this phase
+    // (it's charts/histograms, not a list) — this is the only on-screen
+    // indicator of which sample `r` would replay, so it's appended rather
+    // than replacing `app.status.text` outright.
+    let text = match app.audit_history.get(app.audit_history_selected) {
+        Some(sample) => format!(
+            "{} | selected {}/{} @ {} [r]eplay",
+            app.status.text,
+            app.audit_history_selected + 1,
+            app.audit_history.len(),
+            sample.timestamp.format("%Y-%m-%d %H:%M UTC")
+        ),
+        None => app.status.text.clone(),
+    };
+    frame.render_widget(Paragraph::new(text).style(style), area);
 }
 
 fn resample_values(values: &[u64], width: usize) -> Vec<u64> {

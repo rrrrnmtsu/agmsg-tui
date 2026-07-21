@@ -238,6 +238,9 @@ mod tests {
             audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
+            keys_file: temp.path().join("keys.toml"),
+            hosts_file: temp.path().join("hosts.toml"),
+            remote_dir: temp.path().join("agmsg-remote"),
         })
         .expect("app");
         (temp, app)
@@ -362,6 +365,9 @@ mod tests {
             audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
+            keys_file: temp.path().join("keys.toml"),
+            hosts_file: temp.path().join("hosts.toml"),
+            remote_dir: temp.path().join("agmsg-remote"),
         })
         .expect("app");
         let backend = TestBackend::new(80, 24);
@@ -410,6 +416,9 @@ mod tests {
             audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
+            keys_file: temp.path().join("keys.toml"),
+            hosts_file: temp.path().join("hosts.toml"),
+            remote_dir: temp.path().join("agmsg-remote"),
         })
         .expect("app");
         let backend = TestBackend::new(40, 24);
@@ -459,6 +468,9 @@ mod tests {
             audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
+            keys_file: temp.path().join("keys.toml"),
+            hosts_file: temp.path().join("hosts.toml"),
+            remote_dir: temp.path().join("agmsg-remote"),
         })
         .expect("app");
         app.screen = Screen::Help;
@@ -521,6 +533,9 @@ mod tests {
             audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
+            keys_file: temp.path().join("keys.toml"),
+            hosts_file: temp.path().join("hosts.toml"),
+            remote_dir: temp.path().join("agmsg-remote"),
         })
         .expect("app");
         // help_return_screen mirrors how `?` is reached from the Agents
@@ -607,6 +622,9 @@ mod tests {
             audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
+            keys_file: temp.path().join("keys.toml"),
+            hosts_file: temp.path().join("hosts.toml"),
+            remote_dir: temp.path().join("agmsg-remote"),
         })
         .expect("app");
         app.screen = Screen::Audit;

@@ -57,6 +57,18 @@ pub struct Cli {
     /// color palette (safe = 色覚多様性対応 Okabe-Ito palette)
     #[arg(long, value_enum)]
     pub palette: Option<PaletteArg>,
+
+    /// keys.toml のパス (省略時 ~/.config/agmsg-tui/keys.toml)
+    #[arg(long)]
+    pub keys: Option<PathBuf>,
+
+    /// デフォルトのkeys.tomlをstdoutへ出力して終了する
+    #[arg(long)]
+    pub print_default_keys: bool,
+
+    /// hosts.toml のパス (省略時 ~/.config/agmsg-tui/hosts.toml、省略時ファイル不在ならlocal-only)
+    #[arg(long)]
+    pub hosts: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -97,6 +109,12 @@ pub struct Paths {
     pub audit_history: PathBuf,
     pub report_dir: PathBuf,
     pub state_file: PathBuf,
+    pub keys_file: PathBuf,
+    /// `~/.config/agmsg-tui/hosts.toml` (Phase 14B multi-host config).
+    pub hosts_file: PathBuf,
+    /// `~/.agents/agmsg-remote/` — where fetched host snapshots
+    /// (`<name>.db`) are promoted to after `PRAGMA quick_check` passes.
+    pub remote_dir: PathBuf,
 }
 
 impl Paths {
@@ -138,6 +156,15 @@ impl Paths {
                 .or_else(|| env::var_os("AGMSG_REPORT_DIR").map(PathBuf::from))
                 .unwrap_or_else(|| home.join("tmp")),
             state_file: home.join(".config/agmsg-tui/state.json"),
+            keys_file: cli
+                .keys
+                .clone()
+                .unwrap_or_else(|| home.join(".config/agmsg-tui/keys.toml")),
+            hosts_file: cli
+                .hosts
+                .clone()
+                .unwrap_or_else(|| home.join(".config/agmsg-tui/hosts.toml")),
+            remote_dir: home.join(".agents/agmsg-remote"),
         })
     }
 }

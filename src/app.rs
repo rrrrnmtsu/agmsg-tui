@@ -25,15 +25,19 @@ use crate::bulk::{
 use crate::config::Paths;
 use crate::db::{
     ANALYTICS_WINDOW_DAYS, AgentIdentitySummary, AgentTeamSummary, BodySizeDistribution, Database,
-    MemberSummary, Message, PairMatrix, STALE_UNREAD_DAYS, StaleUnread, TeamSummary,
+    LOCAL_HOST, MemberSummary, Message, PairMatrix, STALE_UNREAD_DAYS, StaleUnread, TeamSummary,
     ZombieIdentity,
 };
 use crate::exec::{CommandResult, reset_command_display};
 use crate::health::{HealthSnapshot, TeamHealth};
+use crate::keys::{Action, KeyMap};
+use crate::launchagent;
 use crate::notify::{
     BURST_ALERT_DURATION, BurstTracker, NOTIFY_SETTING_COUNT, NotifySettings, PendingNotification,
 };
-use crate::state::PersistentState;
+use crate::pane::{PaneIdx, PaneState, PaneView, SplitMode};
+use crate::remote;
+use crate::state::{PersistentState, ReplayState};
 use crate::ui::{
     MouseTarget, SIDEBAR_MAX_PCT, SIDEBAR_MIN_PCT, compute_layout, hit_test, resize_pct_from_column,
 };
@@ -49,6 +53,13 @@ pub const FOLD_CHAR_THRESHOLD: usize = 500;
 pub const FOLD_PREVIEW_LINES: usize = 20;
 pub const BODY_WARN_BYTES: usize = 2_048;
 pub const BODY_BLOCK_BYTES: usize = 4_096;
+/// Phase 14A: below this terminal height, entering split view is refused
+/// (status-line message instead) — two stacked panes plus their own borders
+/// and status row would otherwise render unusably short.
+pub const MIN_SPLIT_HEIGHT: u16 = 24;
+/// Phase 14A: side-by-side layout requires this many columns; narrower
+/// (including the 80-col reference terminal) stacks the two panes instead.
+pub const SPLIT_WIDE_THRESHOLD: u16 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -234,6 +245,12 @@ pub struct App {
     pub teams: Vec<TeamSummary>,
     pub selected_team: usize,
     pub active_team: Option<String>,
+    /// Host of `active_team` (`LOCAL_HOST` or a `hosts.toml` host name),
+    /// memoized alongside it in `reload_selected_team` — routes
+    /// member/message queries to the right `Database` (Phase 14B) without
+    /// re-deriving it from `self.teams` by name, which would be ambiguous
+    /// if a remote host happens to reuse a local team name.
+    pub active_team_host: String,
     pub members: Vec<MemberSummary>,
     pub selected_member: usize,
     pub messages: Vec<Message>,
@@ -263,6 +280,11 @@ pub struct App {
     pub audit_team_index: usize,
     pub audit_selected: usize,
     pub audit_detail: Option<String>,
+    /// Phase 14E: which row of `audit_history` is highlighted in the
+    /// HISTORY tab — `r` replays that sample's timestamp. Clamped in
+    /// `refresh_audit_insights` whenever `audit_history` is reloaded, same
+    /// pattern as `audit_selected`/`audit_item_count`.
+    pub audit_history_selected: usize,
     pub health_snapshot: Option<HealthSnapshot>,
     pub health_loading: bool,
     pub health_window_days: u32,
@@ -326,6 +348,47 @@ pub struct App {
     /// one-shot status warning so a broken terminal doesn't spam the status
     /// line on every subsequent message arrival.
     notify_delivery_warned: bool,
+    /// Phase 14C: remappable global/screen-entry keymap, loaded from
+    /// `~/.config/agmsg-tui/keys.toml` by `main.rs` and assigned onto this
+    /// field after `App::load` returns (so `App::load` itself — used
+    /// pervasively by tests — always starts from `KeyMap::default()` and
+    /// stays independent of any keys.toml on the test-runner's machine).
+    pub keymap: KeyMap,
+    /// Phase 14D: `com.remma.agmsg-audit-daily` LaunchAgent status shown on
+    /// the HEALTH screen's Automation row. `None` until the Health screen is
+    /// first opened (probed lazily there, same lazy-on-first-visit shape as
+    /// `health_snapshot`) or after a probe/toggle explicitly sets it.
+    pub launchagent: Option<launchagent::LaunchAgentStatus>,
+    /// Injectable subprocess runner for `launchctl`/`plutil` calls — always
+    /// `launchagent::RealCommandRunner` in production; tests substitute a
+    /// fake so `handle_key`-driven toggle tests never spawn a real process.
+    pub launchagent_runner: std::sync::Arc<dyn launchagent::CommandRunner>,
+    /// Phase 14B: configured remote hosts (from `hosts.toml`) plus their
+    /// live connectivity status and, once fetched, an opened read-only
+    /// snapshot `Database`. Empty by default (`App::load` never populates
+    /// this — `main.rs` assigns it after loading `hosts.toml`, same
+    /// post-load-assignment shape as `keymap`), so every existing test
+    /// using `App::load` directly stays in local-only mode with zero
+    /// behavior change.
+    pub hosts: Vec<remote::HostRuntime>,
+    /// Phase 14A: `Off` unless the user has toggled split view on with
+    /// `Ctrl+S` (or a second `Ctrl+S`/`Esc` to turn it back off). While
+    /// `Split`, the *active* pane's data lives in this struct's own
+    /// selected_team/members/messages/focus/etc. fields (same fields used
+    /// pre-14A) — the inactive pane's frozen copy lives in `second`. See
+    /// `swap_active_pane`'s doc comment for why.
+    pub split: SplitMode,
+    /// Last known terminal size, refreshed by `main.rs` on every key event
+    /// (mouse events already get one via `handle_mouse`'s `terminal_area`
+    /// param). Used only to gate the `MIN_SPLIT_HEIGHT` split-entry guard —
+    /// defaults generously large so `App::load`-based tests (which never
+    /// call the setter) can toggle split freely unless a test narrows it.
+    pub term_area: Rect,
+    /// Phase 14E: `Some` while a HISTORY-tab replay snapshot is active — see
+    /// `ReplayState`'s doc comment. Mutually exclusive with `split` (entering
+    /// one while the other is active is refused with a status message rather
+    /// than composing the two, per the phase scope guard).
+    pub replay: Option<ReplayState>,
 }
 
 impl App {
@@ -346,6 +409,7 @@ impl App {
             teams,
             selected_team,
             active_team,
+            active_team_host: LOCAL_HOST.to_owned(),
             members: Vec::new(),
             selected_member: 0,
             messages: Vec::new(),
@@ -375,6 +439,7 @@ impl App {
             audit_team_index: 0,
             audit_selected: 0,
             audit_detail: None,
+            audit_history_selected: 0,
             health_snapshot: None,
             health_loading: false,
             health_window_days: 7,
@@ -408,6 +473,13 @@ impl App {
             poll_offline: false,
             state_dirty_since: None,
             notify_delivery_warned: false,
+            keymap: KeyMap::default(),
+            launchagent: None,
+            launchagent_runner: std::sync::Arc::new(launchagent::RealCommandRunner),
+            hosts: Vec::new(),
+            split: SplitMode::Off,
+            term_area: Rect::new(0, 0, 120, 40),
+            replay: None,
         };
         app.reload_selected_team()?;
         app.state_dirty_since = None;
@@ -635,9 +707,19 @@ impl App {
     /// return an `AppAction` — unlike key handling, no mouse gesture here
     /// triggers a send/mark-read/audit subprocess.
     pub fn handle_mouse(&mut self, event: MouseEvent, terminal_area: Rect) {
+        self.term_area = terminal_area;
         // Composer/Audit/Help screens keep their own keyboard-only nav for now;
         // mouse focus/resize is scoped to the 3-pane main screen (§1 of the ask).
         if self.screen != Screen::Main {
+            return;
+        }
+        // Phase 14A non-goal: cross-pane drag-and-drop, and click-to-focus
+        // hit-testing in general isn't pane-aware yet — `compute_layout`
+        // below still assumes a single full-area pane, which doesn't match
+        // what's on screen once split is on. Refusing mouse input here
+        // (rather than hit-testing against the wrong regions) avoids
+        // corrupting the active pane's focus from stale coordinates.
+        if matches!(self.split, SplitMode::Split { .. }) {
             return;
         }
         let previous_sidebar_pct = self.sidebar_pct;
@@ -666,7 +748,12 @@ impl App {
     }
 
     pub fn receive_new_messages(&mut self, messages: Vec<Message>) -> Result<()> {
-        if messages.is_empty() {
+        // Phase 14E: a frozen replay view must stay frozen — live arrivals
+        // would otherwise silently mutate the "as of" snapshot the user is
+        // looking at out from under them. The poller keeps running (so
+        // `last_seen_id` doesn't fall behind and flood in on exit); this is
+        // just where the results get dropped instead of applied.
+        if messages.is_empty() || self.replay.is_some() {
             return Ok(());
         }
         let was_following = self.messages.is_empty()
@@ -869,6 +956,64 @@ impl App {
         AppAction::RefreshAudit
     }
 
+    /// Phase 14E: `r` on the HISTORY tab's selected sample. Refuses while
+    /// split is active (see `App.replay`'s doc comment for why the two modes
+    /// don't compose) rather than deciding what a replayed *second* pane
+    /// would even mean; routes to `Screen::Main` with `data_as_of` now
+    /// returning that sample's timestamp, same trigger/route the plan doc
+    /// specifies.
+    fn enter_replay_from_history(&mut self) -> Result<AppAction> {
+        if matches!(self.split, SplitMode::Split { .. }) {
+            self.status = StatusLine {
+                text: "replay disabled while split view is active".to_owned(),
+                is_error: true,
+            };
+            return Ok(AppAction::None);
+        }
+        let Some(sample) = self.audit_history.get(self.audit_history_selected) else {
+            self.status = StatusLine {
+                text: "no history sample selected".to_owned(),
+                is_error: true,
+            };
+            return Ok(AppAction::None);
+        };
+        let snapshot_ts = sample.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let label = sample.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+        self.status = StatusLine {
+            text: format!("replay @ {label} — Esc to exit"),
+            is_error: false,
+        };
+        self.replay = Some(ReplayState {
+            snapshot_ts,
+            label,
+            return_to_audit: true,
+        });
+        self.screen = Screen::Main;
+        self.reload_selected_team()?;
+        Ok(AppAction::None)
+    }
+
+    /// Clears replay and reloads live data — called from `Esc` on Main
+    /// (`return_to_audit` routes back to Audit/History) and from the Main
+    /// keymap's `Action::Replay` (Ctrl+R toggles replay off the same way,
+    /// per the "wire up the reserved 14C binding" ask — HISTORY-tab `r`
+    /// remains the sole *entry* point, this is only ever an exit).
+    fn exit_replay(&mut self) -> Result<()> {
+        let Some(state) = self.replay.take() else {
+            return Ok(());
+        };
+        self.reload_selected_team()?;
+        if state.return_to_audit {
+            self.screen = Screen::Audit;
+            self.audit_tab = AuditTab::History;
+        }
+        self.status = StatusLine {
+            text: "replay ended".to_owned(),
+            is_error: false,
+        };
+        Ok(())
+    }
+
     pub fn complete_health(&mut self, snapshot: HealthSnapshot) {
         self.health_loading = false;
         self.health_team_index = self
@@ -1040,12 +1185,103 @@ impl App {
         if self.input_mode == InputMode::Search {
             return self.handle_search_key(key);
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
-            self.open_bulk_filter()?;
-            return Ok(AppAction::None);
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
-            return self.open_audit();
+        // Phase 14C: the scoped global/screen-entry actions (quit, help,
+        // compose, audit, agents, health, bulk, filter, notif_settings,
+        // nav_up, nav_down, tab_next) are dispatched through the remappable
+        // keymap instead of hardcoded `if`/`match` arms — this is the sole
+        // trigger for those actions now, so a user remap is authoritative
+        // (e.g. remapping `audit` away from ctrl+a means ctrl+a stops
+        // opening Audit). `Split`/`Replay` are reserved names for 14A/14E:
+        // matched here but intentionally left as no-ops so control falls
+        // through to the unchanged code below (today that means ctrl+s/
+        // ctrl+r behave exactly as they did pre-14C, since the `match
+        // key.code` arms below never checked modifiers either).
+        if let Some(action) = self.keymap.lookup(key) {
+            match action {
+                Action::Quit => return Ok(AppAction::Quit),
+                Action::Help => {
+                    self.help_return_screen = Screen::Main;
+                    self.help_scroll = 0;
+                    self.screen = Screen::Help;
+                    return Ok(AppAction::None);
+                }
+                Action::Compose => {
+                    self.open_composer()?;
+                    return Ok(AppAction::None);
+                }
+                Action::Audit => return self.open_audit(),
+                Action::Agents => {
+                    self.open_agents();
+                    return Ok(AppAction::None);
+                }
+                Action::Health => return Ok(self.open_health()),
+                Action::Bulk => {
+                    self.open_bulk_filter()?;
+                    return Ok(AppAction::None);
+                }
+                Action::Filter => {
+                    self.toggle_member_filter();
+                    return Ok(AppAction::None);
+                }
+                Action::NotifSettings => {
+                    self.notify_popup = Some(0);
+                    return Ok(AppAction::None);
+                }
+                Action::NavUp => {
+                    self.move_up()?;
+                    return Ok(AppAction::None);
+                }
+                Action::NavDown => {
+                    self.move_down();
+                    return Ok(AppAction::None);
+                }
+                Action::TabNext => {
+                    // Phase 14A: while split is on, Tab switches which pane
+                    // is active instead of cycling TEAMS/MEMBERS/ROOM focus
+                    // within one pane — the plan doc calls this out
+                    // explicitly ("takes precedence over Tab's current
+                    // Main-screen behavior only in split mode"). Off-mode
+                    // behavior (focus_next) is untouched.
+                    if matches!(self.split, SplitMode::Split { .. }) {
+                        self.swap_active_pane();
+                    } else {
+                        self.focus = self.focus_next();
+                    }
+                    return Ok(AppAction::None);
+                }
+                Action::Split => {
+                    // Phase 14E: split and replay are mutually exclusive
+                    // Main-mode modifiers (see `App.replay`'s doc comment) —
+                    // refuse rather than let `Ctrl+S` silently corrupt a
+                    // frozen replay view by seeding a second live pane.
+                    if self.replay.is_some() {
+                        self.status = StatusLine {
+                            text: "split disabled while replaying".to_owned(),
+                            is_error: true,
+                        };
+                        return Ok(AppAction::None);
+                    }
+                    self.toggle_split()?;
+                    return Ok(AppAction::None);
+                }
+                // Phase 14E: Ctrl+R was reserved as a no-op by 14C; wired up
+                // here as replay's *exit* path (mirrors Esc — see
+                // `exit_replay`'s doc comment). Entry stays HISTORY-tab-only
+                // (`r` there, not globalized onto Main — bare `r` on Main
+                // already means "mark recipient read", see the `match
+                // key.code` arm below).
+                Action::Replay => {
+                    if self.replay.is_some() {
+                        self.exit_replay()?;
+                    }
+                    return Ok(AppAction::None);
+                }
+                // Reserved/screen-local: LaunchagentToggle is deliberately
+                // screen-local to Health only (see
+                // `Action::LaunchagentToggle` doc comment) and is dispatched
+                // from `handle_health_key` instead.
+                Action::LaunchagentToggle => {}
+            }
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
             self.notify_settings.bell = !self.notify_settings.bell;
@@ -1057,10 +1293,6 @@ impl App {
                 },
                 is_error: false,
             };
-            return Ok(AppAction::None);
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
-            self.notify_popup = Some(0);
             return Ok(AppAction::None);
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
@@ -1084,21 +1316,39 @@ impl App {
                 };
                 return Ok(AppAction::None);
             }
+            // Phase 14A: outermost mode wins first — search/filter (inner,
+            // per-pane-ish state) already returned above, so a bare Esc
+            // that reaches here with split on means "leave split", matching
+            // the plan doc's "Esc also exits split" contract.
+            if matches!(self.split, SplitMode::Split { .. }) {
+                self.exit_split();
+                return Ok(AppAction::None);
+            }
+            // Phase 14E: replay is a Main-mode modifier same as split (see
+            // `App.replay`'s doc comment on why the two never coexist), so
+            // it slots into this same outermost-mode-wins-last chain.
+            if self.replay.is_some() {
+                self.exit_replay()?;
+                return Ok(AppAction::None);
+            }
             return Ok(AppAction::None);
         }
         match key.code {
-            KeyCode::Char('q') => return Ok(AppAction::Quit),
-            KeyCode::Tab => self.focus = self.focus_next(),
+            // Bare 'q', Tab, bare 'j'/'k', 'c', 'A', 'H', 'F', '?' moved to
+            // the keymap dispatch above (Phase 14C scoped actions). Arrow
+            // keys (Down/Up) and BackTab stay hardcoded here as an
+            // always-on navigation fallback — not remappable, so a bad
+            // keys.toml can never lock a user out of moving the cursor or
+            // reversing focus.
             KeyCode::BackTab => self.focus = self.focus_previous(),
-            KeyCode::Char('j') | KeyCode::Down => self.move_down(),
-            KeyCode::Char('k') | KeyCode::Up => self.move_up()?,
+            KeyCode::Down => self.move_down(),
+            KeyCode::Up => self.move_up()?,
             KeyCode::Char('g') => self.move_first(),
             KeyCode::Char('G') => self.move_last(),
             KeyCode::Char('u') => self.move_to_next_unread(),
             KeyCode::Char('[') => self.cycle_team(-1)?,
             KeyCode::Char(']') => self.cycle_team(1)?,
             KeyCode::Enter => self.activate_selection()?,
-            KeyCode::Char('c') => self.open_composer()?,
             KeyCode::Char('r') => return self.mark_selected_action(),
             // Guarded arms must precede the plain 'n'/'R' ones below: with
             // MEMBER pane focus these are agents-adjacent actions (Phase
@@ -1111,14 +1361,21 @@ impl App {
                 self.open_agents_rename_from_members();
             }
             KeyCode::Char('R') => return self.mark_team_action(),
-            KeyCode::Char('a') => return self.open_audit(),
-            KeyCode::Char('A') => self.open_agents(),
-            KeyCode::Char('H') => return Ok(self.open_health()),
+            // Bare 'a' stays as a hardcoded convenience alias for Audit,
+            // alongside (not through) the remappable Ctrl+A keymap binding
+            // — see keys.rs's `default_bindings()` doc comment for why. The
+            // CONTROL guard keeps this arm from incidentally re-catching
+            // Ctrl+A once a user remaps `audit` away from it — crossterm
+            // reports Ctrl+A as the same `KeyCode::Char('a')`, and a plain
+            // `match key.code` (like the pre-14C code this replaces) can't
+            // tell the two apart on its own.
+            KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return self.open_audit();
+            }
             KeyCode::Char('x') | KeyCode::Char('X') => self.toggle_message_fold(),
             KeyCode::Char('f') => self.toggle_fold_all(),
             KeyCode::Char('s') => self.jump_to_sender(),
             KeyCode::Char('I') => self.toggle_member_info()?,
-            KeyCode::Char('F') => self.toggle_member_filter(),
             KeyCode::Char('M') => return self.mark_member_action(),
             KeyCode::Char('/') => self.begin_search(),
             KeyCode::Char('n') => self.cycle_search_match(1),
@@ -1128,11 +1385,6 @@ impl App {
                     return Ok(AppAction::Yank(body.to_owned()));
                 }
                 self.status = validation_status("no message selected".to_owned());
-            }
-            KeyCode::Char('?') => {
-                self.help_return_screen = Screen::Main;
-                self.help_scroll = 0;
-                self.screen = Screen::Help;
             }
             _ => {}
         }
@@ -2028,6 +2280,17 @@ impl App {
                     return Ok(self.request_audit_refresh());
                 }
                 KeyCode::Char('E') | KeyCode::Char('x') => return Ok(AppAction::ExportReport),
+                // Phase 14E: which sample `r` replays — j/k here are net-new
+                // (the HISTORY tab had no row selection before this phase;
+                // the chart/histogram views don't need one).
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.audit_history_selected = (self.audit_history_selected + 1)
+                        .min(self.audit_history.len().saturating_sub(1));
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.audit_history_selected = self.audit_history_selected.saturating_sub(1);
+                }
+                KeyCode::Char('r') => return self.enter_replay_from_history(),
                 KeyCode::Char('?') => {
                     self.help_return_screen = Screen::Audit;
                     self.help_scroll = 0;
@@ -2088,6 +2351,13 @@ impl App {
     }
 
     fn handle_health_key(&mut self, key: KeyEvent) -> Result<AppAction> {
+        // Phase 14D: routed through the keymap (like the Main-screen global
+        // actions) even though this dispatch point is screen-local — see
+        // `keys::Action::LaunchagentToggle` doc comment for why.
+        if matches!(self.keymap.lookup(key), Some(Action::LaunchagentToggle)) {
+            self.toggle_launchagent();
+            return Ok(AppAction::None);
+        }
         match key.code {
             KeyCode::Char('q') => return Ok(AppAction::Quit),
             KeyCode::Esc | KeyCode::Char('H') => self.screen = Screen::Main,
@@ -2119,10 +2389,90 @@ impl App {
 
     fn open_health(&mut self) -> AppAction {
         self.screen = Screen::Health;
+        if self.launchagent.is_none() {
+            self.refresh_launchagent();
+        }
         if self.health_snapshot.is_none() {
             self.request_health_refresh()
         } else {
             AppAction::None
+        }
+    }
+
+    /// Probes `com.remma.agmsg-audit-daily`'s current state (loaded/
+    /// unloaded/missing/unsupported + next-run) via the injected
+    /// `launchagent_runner` and stores it on `self.launchagent`. Synchronous
+    /// (unlike `request_health_refresh`'s channel-based async pattern):
+    /// `launchctl list` + `plutil -convert json` are two short-lived local
+    /// subprocess calls, not the kind of open-ended I/O (remote scripts,
+    /// audit runs) the async `AppAction` pipeline exists to keep off the
+    /// input-handling path for.
+    fn refresh_launchagent(&mut self) {
+        let plist_path = launchagent::default_plist_path(launchagent::AUDIT_DAILY_LABEL);
+        self.launchagent = Some(launchagent::probe(
+            self.launchagent_runner.as_ref(),
+            launchagent::AUDIT_DAILY_LABEL,
+            &plist_path,
+        ));
+    }
+
+    /// `L` on the Health screen: loads the LaunchAgent if unloaded, unloads
+    /// it if loaded, then re-probes so the row reflects the *actual*
+    /// resulting state rather than trusting the toggle command's own exit
+    /// code (a `launchctl load` on an already-loaded agent still exits 0).
+    fn toggle_launchagent(&mut self) {
+        let Some(status) = self.launchagent.as_ref() else {
+            self.refresh_launchagent();
+            return;
+        };
+        match status.state {
+            launchagent::LaState::Missing => {
+                self.status = StatusLine {
+                    text: format!("{}: plist not found", launchagent::AUDIT_DAILY_LABEL),
+                    is_error: true,
+                };
+                return;
+            }
+            launchagent::LaState::Unsupported => {
+                self.status = StatusLine {
+                    text: "LaunchAgent control: unsupported on this OS".to_owned(),
+                    is_error: true,
+                };
+                return;
+            }
+            launchagent::LaState::Loaded { .. } | launchagent::LaState::Unloaded => {}
+        }
+        let currently_loaded = status.is_loaded();
+        let plist_path = launchagent::default_plist_path(launchagent::AUDIT_DAILY_LABEL);
+        match launchagent::toggle(self.launchagent_runner.as_ref(), &plist_path, currently_loaded)
+        {
+            Ok(outcome) if outcome.success => {
+                self.refresh_launchagent();
+                let verb = if currently_loaded { "unloaded" } else { "loaded" };
+                self.status = StatusLine {
+                    text: format!("{} {verb}", launchagent::AUDIT_DAILY_LABEL),
+                    is_error: false,
+                };
+            }
+            Ok(outcome) => {
+                self.status = StatusLine {
+                    text: format!(
+                        "launchctl failed: {}",
+                        if outcome.stderr.is_empty() {
+                            "unknown error"
+                        } else {
+                            outcome.stderr.as_str()
+                        }
+                    ),
+                    is_error: true,
+                };
+            }
+            Err(error) => {
+                self.status = StatusLine {
+                    text: format!("launchctl failed: {error}"),
+                    is_error: true,
+                };
+            }
         }
     }
 
@@ -2807,8 +3157,19 @@ impl App {
 
     fn refresh_audit_insights(&mut self) -> Result<()> {
         self.audit_history = read_audit_history(&self.paths.audit_history)?;
+        self.audit_history_selected = self
+            .audit_history_selected
+            .min(self.audit_history.len().saturating_sub(1));
         self.body_size_distribution = self.database.body_size_distribution()?;
         Ok(())
+    }
+
+    /// Phase 14E: the `created_at <= ?` cutoff every Main-view message/member
+    /// query threads through while replaying — `None` outside replay, which
+    /// every `*_as_of` db.rs wrapper treats as "no filter" (identical to the
+    /// pre-14E query).
+    pub fn data_as_of(&self) -> Option<&str> {
+        self.replay.as_ref().map(|state| state.snapshot_ts.as_str())
     }
 
     fn cycle_audit_pair_window(&mut self) -> Result<()> {
@@ -3224,11 +3585,49 @@ impl App {
         }
     }
 
+    /// Phase 14B write guard: remote-host teams are read-only snapshots —
+    /// the send/reset/mark-read scripts only exist on the local machine.
+    /// Disables at the compose *entry point* rather than failing at send
+    /// time (plan doc rationale: failing late would waste a typed
+    /// message). Returns `true` and leaves `self.composer` untouched when
+    /// the active team isn't local, after setting an explanatory status.
+    fn active_team_is_remote(&mut self) -> bool {
+        if self.active_team_host == LOCAL_HOST {
+            return false;
+        }
+        self.status = StatusLine {
+            text: format!("read-only: team lives on host '{}'", self.active_team_host),
+            is_error: true,
+        };
+        true
+    }
+
+    /// Phase 14E: same guard shape as `active_team_is_remote` — composing
+    /// into a frozen historical snapshot doesn't have a sensible target (the
+    /// message would land "in the past" relative to what's on screen), so
+    /// it's refused the same way a remote read-only team is.
+    fn replay_blocks_write(&mut self) -> bool {
+        if self.replay.is_none() {
+            return false;
+        }
+        self.status = StatusLine {
+            text: "compose disabled in replay mode".to_owned(),
+            is_error: true,
+        };
+        true
+    }
+
     /// Enter on the MEMBER column: open the composer pre-addressed to the
     /// selected member, defaulting `from` to `current_identity` when it's
     /// present in the roster (falls back to roster[0], same default `c`
     /// already uses for an unset `to`).
     fn open_composer_for_member(&mut self) -> Result<()> {
+        if self.replay_blocks_write() {
+            return Ok(());
+        }
+        if self.active_team_is_remote() {
+            return Ok(());
+        }
         let Some(team) = self.selected_team_name().map(str::to_owned) else {
             return Ok(());
         };
@@ -3395,6 +3794,12 @@ impl App {
     }
 
     fn open_composer(&mut self) -> Result<()> {
+        if self.replay_blocks_write() {
+            return Ok(());
+        }
+        if self.active_team_is_remote() {
+            return Ok(());
+        }
         let Some(team) = self.selected_team_name().map(str::to_owned) else {
             return Ok(());
         };
@@ -3477,6 +3882,9 @@ impl App {
             self.update_spinner_status();
             return Ok(AppAction::None);
         }
+        if self.active_team_is_remote() {
+            return Ok(AppAction::None);
+        }
         let Some(message) = self.selected_message() else {
             self.status = validation_status("no message selected".to_owned());
             return Ok(AppAction::None);
@@ -3505,6 +3913,9 @@ impl App {
             self.update_spinner_status();
             return Ok(AppAction::None);
         }
+        if self.active_team_is_remote() {
+            return Ok(AppAction::None);
+        }
         let Some(team) = self.selected_team_name().map(str::to_owned) else {
             self.status = validation_status("no team selected".to_owned());
             return Ok(AppAction::None);
@@ -3525,8 +3936,11 @@ impl App {
         let Some(team) = self.selected_team_name().map(str::to_owned) else {
             return Ok(());
         };
+        let Some(database) = self.database_for_host(&self.active_team_host) else {
+            return Ok(()); // remote host has no snapshot yet
+        };
         let before_id = self.messages.first().map(|message| message.id);
-        let page = self.database.history(&team, before_id, HISTORY_PAGE_SIZE)?;
+        let page = database.history_as_of(&team, before_id, HISTORY_PAGE_SIZE, self.data_as_of())?;
         let inserted = page.messages.len();
         if inserted > 0 {
             let mut messages = page.messages;
@@ -3538,19 +3952,86 @@ impl App {
         Ok(())
     }
 
+    /// Read-only `Database` for `host`: the local connection for
+    /// `LOCAL_HOST`, or a configured remote host's opened snapshot once one
+    /// has been fetched successfully — `None` if that host hasn't produced
+    /// a good snapshot yet (team list still shows it, dimmed, per the plan
+    /// doc's "offline rows retained from last good snapshot" rule; message
+    /// loads just no-op until the next successful fetch).
+    fn database_for_host(&self, host: &str) -> Option<&Database> {
+        if host == LOCAL_HOST {
+            Some(&self.database)
+        } else {
+            self.hosts
+                .iter()
+                .find(|runtime| runtime.config.name == host)
+                .and_then(|runtime| runtime.db.as_ref())
+        }
+    }
+
+    /// Rust-level union of the local team list with every remote host's
+    /// (Phase 14B) — no cross-database SQL, each `Database` is queried
+    /// independently and results are tagged with `host` (see
+    /// `db::Database::team_summaries_for_host`). A remote host with no
+    /// snapshot yet, or whose snapshot query errors (e.g. mid-fetch tear
+    /// despite `quick_check`), simply contributes no rows this refresh
+    /// rather than failing the whole call — its status in `self.hosts`
+    /// already reflects the problem.
+    fn merged_team_summaries(&self) -> Result<Vec<TeamSummary>> {
+        let mut teams = self.database.team_summaries(&self.paths.teams_dir)?;
+        for host in &self.hosts {
+            if let Some(database) = &host.db
+                && let Ok(remote_teams) =
+                    database.team_summaries_for_host(&remote::empty_teams_dir(), &host.config.name)
+            {
+                teams.extend(remote_teams);
+            }
+        }
+        Ok(teams)
+    }
+
     fn refresh_team_summaries(&mut self) -> Result<()> {
+        // Track selection by (name, host) rather than name alone — once
+        // remote hosts are configured, two teams can share a bare name
+        // across hosts and a name-only lookup would risk re-selecting the
+        // wrong one after a refresh.
         let selected = self
             .teams
             .get(self.selected_team)
-            .map(|team| team.name.clone());
-        self.teams = self.database.team_summaries(&self.paths.teams_dir)?;
-        if let Some(selected) = selected
-            && let Some(index) = self.teams.iter().position(|team| team.name == selected)
+            .map(|team| (team.name.clone(), team.host.clone()));
+        self.teams = self.merged_team_summaries()?;
+        if let Some((name, host)) = selected
+            && let Some(index) = self
+                .teams
+                .iter()
+                .position(|team| team.name == name && team.host == host)
         {
             self.selected_team = index;
         }
         self.selected_team = self.selected_team.min(self.teams.len().saturating_sub(1));
         Ok(())
+    }
+
+    /// Sets the configured remote hosts (called once from `main.rs` after
+    /// loading `hosts.toml`, same post-load-assignment shape as `keymap`)
+    /// and immediately folds any already-fetched snapshots into the team
+    /// list.
+    pub fn set_hosts(&mut self, hosts: Vec<remote::HostRuntime>) -> Result<()> {
+        self.hosts = hosts;
+        self.refresh_team_summaries()
+    }
+
+    /// Applies one background fetch outcome (Phase 14B scheduler event,
+    /// drained in `main.rs`'s event loop the same way `complete_audit`/
+    /// `complete_health` drain their channels) and refreshes the team list
+    /// so a newly-successful snapshot's teams appear without waiting for
+    /// the next unrelated redraw trigger.
+    pub fn complete_host_fetch(&mut self, outcome: remote::HostFetchOutcome) -> Result<()> {
+        let remote_dir = self.paths.remote_dir.clone();
+        if let Some(host) = self.hosts.iter_mut().find(|host| host.config.name == outcome.name) {
+            host.apply_outcome(&outcome, &remote_dir);
+        }
+        self.refresh_team_summaries()
     }
 
     fn refresh_members(&mut self) -> Result<()> {
@@ -3559,9 +4040,20 @@ impl App {
             self.selected_member = 0;
             return Ok(());
         };
-        self.members = self
-            .database
-            .member_summaries(&self.paths.teams_dir, &team)?;
+        if self.active_team_host != LOCAL_HOST {
+            // Remote hosts have no local roster (config.json) mirror —
+            // non-goal per the 14B plan doc. Message history still loads
+            // (below, in reload_selected_team); only the MEMBER pane is
+            // empty for a remote team.
+            self.members.clear();
+            self.selected_member = 0;
+            return Ok(());
+        }
+        self.members = self.database.member_summaries_as_of(
+            &self.paths.teams_dir,
+            &team,
+            self.data_as_of(),
+        )?;
         self.selected_member = self
             .selected_member
             .min(self.members.len().saturating_sub(1));
@@ -3569,10 +4061,11 @@ impl App {
     }
 
     fn reload_selected_team(&mut self) -> Result<()> {
-        self.active_team = self
-            .teams
-            .get(self.selected_team)
-            .map(|team| team.name.clone());
+        let selected = self.teams.get(self.selected_team);
+        self.active_team = selected.map(|team| team.name.clone());
+        self.active_team_host = selected
+            .map(|team| team.host.clone())
+            .unwrap_or_else(|| LOCAL_HOST.to_owned());
         self.refresh_members()?;
         let Some(team) = self.selected_team_name().map(str::to_owned) else {
             self.messages.clear();
@@ -3580,11 +4073,184 @@ impl App {
             self.has_more_history = false;
             return Ok(());
         };
-        let page = self.database.history(&team, None, HISTORY_PAGE_SIZE)?;
+        let Some(database) = self.database_for_host(&self.active_team_host) else {
+            self.messages.clear();
+            self.selected_message = 0;
+            self.has_more_history = false;
+            self.status = StatusLine {
+                text: format!("host '{}' snapshot not ready yet", self.active_team_host),
+                is_error: true,
+            };
+            return Ok(());
+        };
+        let page = database.history_as_of(&team, None, HISTORY_PAGE_SIZE, self.data_as_of())?;
         self.messages = page.messages;
         self.has_more_history = page.has_more;
         self.selected_message = self.messages.len().saturating_sub(1);
         Ok(())
+    }
+
+    /// Phase 14A: builds a standalone snapshot of `team_index`'s member/
+    /// message state, independent of `self`'s own selected_team/messages/
+    /// etc. — used to seed the second pane on split-entry without disturbing
+    /// the pane that's about to become "first". Read-only reuse of the same
+    /// `database_for_host`/`member_summaries`/`history` calls
+    /// `reload_selected_team`/`refresh_members` make for the active pane.
+    fn build_pane_state(&self, team_index: usize) -> Result<PaneState> {
+        let selected = self.teams.get(team_index);
+        let active_team = selected.map(|team| team.name.clone());
+        let active_team_host = selected
+            .map(|team| team.host.clone())
+            .unwrap_or_else(|| LOCAL_HOST.to_owned());
+        let members = match &active_team {
+            Some(team) if active_team_host == LOCAL_HOST => self
+                .database
+                .member_summaries(&self.paths.teams_dir, team)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let (messages, has_more_history) = match (&active_team, self.database_for_host(&active_team_host)) {
+            (Some(team), Some(database)) => match database.history(team, None, HISTORY_PAGE_SIZE) {
+                Ok(page) => (page.messages, page.has_more),
+                Err(_) => (Vec::new(), false),
+            },
+            _ => (Vec::new(), false),
+        };
+        let selected_message = messages.len().saturating_sub(1);
+        Ok(PaneState {
+            selected_team: team_index,
+            active_team,
+            active_team_host,
+            members,
+            selected_member: 0,
+            messages,
+            selected_message,
+            focus: Focus::Teams,
+            has_more_history,
+        })
+    }
+
+    /// Phase 14A: `self`'s own selected_team/active_team/members/messages/
+    /// focus/etc. fields always hold whichever pane is currently *active* —
+    /// there is no separate "pane 0 struct". Entering split freezes a
+    /// second team's state into `SplitMode::Split.second`; `Tab` then swaps
+    /// the two so the active pane's data is always reachable through the
+    /// exact same `self.*` fields every pre-14A method already uses,
+    /// instead of every nav/query method (`move_up`, `move_down`,
+    /// `cycle_team`, `activate_selection`, `toggle_message_fold`,
+    /// `open_composer`, …) needing a pane-parameterized twin. This is the
+    /// "do NOT do a full pane-0 field extraction" call from the 14A plan
+    /// doc, implemented as a swap instead of a mutable-reference facade —
+    /// the latter would need `self` split into ~9 disjoint `&mut` borrows
+    /// every time a nav key fires, for no behavioral difference.
+    fn swap_active_pane(&mut self) {
+        if let SplitMode::Split { second, active } = &mut self.split {
+            std::mem::swap(&mut self.selected_team, &mut second.selected_team);
+            std::mem::swap(&mut self.active_team, &mut second.active_team);
+            std::mem::swap(&mut self.active_team_host, &mut second.active_team_host);
+            std::mem::swap(&mut self.members, &mut second.members);
+            std::mem::swap(&mut self.selected_member, &mut second.selected_member);
+            std::mem::swap(&mut self.messages, &mut second.messages);
+            std::mem::swap(&mut self.selected_message, &mut second.selected_message);
+            std::mem::swap(&mut self.focus, &mut second.focus);
+            std::mem::swap(&mut self.has_more_history, &mut second.has_more_history);
+            *active = active.other();
+        }
+    }
+
+    /// `Ctrl+S` on Main (keymap action `split`): turns split view on if it's
+    /// off, off if it's on. Entering split seeds the second pane from the
+    /// next team in the list (wrapping; the same team again if only one
+    /// team is configured — degenerate but not refused, since a single-team
+    /// install has nothing better to show side-by-side).
+    fn toggle_split(&mut self) -> Result<()> {
+        match self.split {
+            SplitMode::Off => {
+                if self.term_area.height < MIN_SPLIT_HEIGHT {
+                    self.status = StatusLine {
+                        text: "terminal too small for split".to_owned(),
+                        is_error: true,
+                    };
+                    return Ok(());
+                }
+                let second_index = if self.teams.len() > 1 {
+                    (self.selected_team + 1) % self.teams.len()
+                } else {
+                    self.selected_team
+                };
+                let second = self.build_pane_state(second_index)?;
+                self.split = SplitMode::Split {
+                    second,
+                    active: PaneIdx::First,
+                };
+                self.status = StatusLine {
+                    text: "split view on (Tab switches pane, Esc/Ctrl+S exits)".to_owned(),
+                    is_error: false,
+                };
+            }
+            SplitMode::Split { .. } => self.exit_split(),
+        }
+        Ok(())
+    }
+
+    /// `self`'s fields already hold the active pane's data (see
+    /// `swap_active_pane`), so exiting split is just dropping `second` —
+    /// the resulting single-pane view is "whichever team the active pane
+    /// was showing", satisfying the 14A spec's Esc/Ctrl+S-exit contract
+    /// with no field copy.
+    fn exit_split(&mut self) {
+        self.split = SplitMode::Off;
+        self.status = StatusLine {
+            text: "split view off".to_owned(),
+            is_error: false,
+        };
+    }
+
+    /// Read-only facade over the *active* pane (always `self`'s own
+    /// fields — see `swap_active_pane`). `member_filter`/`search_query` are
+    /// included here because those two stay global `App` state that only
+    /// ever applies to the active pane (non-goal: independent search/filter
+    /// per pane).
+    pub fn pane_view_active(&self) -> PaneView<'_> {
+        PaneView {
+            teams: &self.teams,
+            selected_team: self.selected_team,
+            active_team: self.active_team.as_deref(),
+            members: &self.members,
+            selected_member: self.selected_member,
+            messages: &self.messages,
+            selected_message: self.selected_message,
+            focus: self.focus,
+            has_more_history: self.has_more_history,
+            member_filter: self.member_filter.as_deref(),
+            search_query: self.search_query.as_deref(),
+            expanded_messages: &self.expanded_messages,
+            current_identity: self.current_identity.as_deref(),
+        }
+    }
+
+    /// Read-only facade over the *inactive* pane's frozen `PaneState`, or
+    /// `None` outside split mode. Never carries `member_filter`/
+    /// `search_query` — those are active-pane-only per the 14A non-goals.
+    pub fn pane_view_inactive(&self) -> Option<PaneView<'_>> {
+        let SplitMode::Split { second, .. } = &self.split else {
+            return None;
+        };
+        Some(PaneView {
+            teams: &self.teams,
+            selected_team: second.selected_team,
+            active_team: second.active_team.as_deref(),
+            members: &second.members,
+            selected_member: second.selected_member,
+            messages: &second.messages,
+            selected_message: second.selected_message,
+            focus: second.focus,
+            has_more_history: second.has_more_history,
+            member_filter: None,
+            search_query: None,
+            expanded_messages: &self.expanded_messages,
+            current_identity: self.current_identity.as_deref(),
+        })
     }
 
     fn begin_search(&mut self) {
@@ -3867,6 +4533,9 @@ mod tests {
             audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
+            keys_file: temp.path().join("keys.toml"),
+            hosts_file: temp.path().join("hosts.toml"),
+            remote_dir: temp.path().join("agmsg-remote"),
         })
         .expect("app");
         (temp, app)
@@ -3904,6 +4573,9 @@ mod tests {
             audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
+            keys_file: temp.path().join("keys.toml"),
+            hosts_file: temp.path().join("hosts.toml"),
+            remote_dir: temp.path().join("agmsg-remote"),
         })
         .expect("app");
         (temp, app)
@@ -4407,6 +5079,9 @@ mod tests {
             audit_history: temp.path().join("audit.jsonl"),
             report_dir: temp.path().join("reports"),
             state_file: temp.path().join("state.json"),
+            keys_file: temp.path().join("keys.toml"),
+            hosts_file: temp.path().join("hosts.toml"),
+            remote_dir: temp.path().join("agmsg-remote"),
         })
         .expect("app");
 
@@ -4527,6 +5202,31 @@ mod tests {
             .expect("open composer");
         let composer = app.composer.as_ref().expect("composer open");
         assert_eq!(composer.from_agent(), Some("codex-worker"));
+    }
+
+    #[test]
+    fn compose_on_remote_host_team_is_rejected_with_status_message() {
+        let (_temp, mut app) = fixture_app();
+        // Simulate a Phase 14B remote-host team without spinning up a real
+        // ssh fetch: push a second team tagged with a non-local host,
+        // select it, and let `reload_selected_team` (invoked by the
+        // Down-then-Enter navigation below) memoize `active_team_host`.
+        app.teams.push(crate::db::TeamSummary {
+            name: "ops".to_owned(),
+            unread_count: 0,
+            host: "vps".to_owned(),
+        });
+        app.selected_team = app.teams.len() - 1;
+        app.active_team = Some("ops".to_owned());
+        app.active_team_host = "vps".to_owned();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+            .expect("attempt compose");
+
+        assert!(app.composer.is_none(), "composer must stay closed for a remote team");
+        assert!(app.status.is_error);
+        assert!(app.status.text.contains("read-only"));
+        assert!(app.status.text.contains("vps"));
     }
 
     #[test]

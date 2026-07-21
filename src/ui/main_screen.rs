@@ -5,9 +5,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::{App, Focus, fold_preview};
+use crate::app::{App, Focus, SPLIT_WIDE_THRESHOLD, fold_preview};
 use crate::color::agent_color;
 use crate::highlight::highlight_body;
+use crate::pane::{PaneView, SplitMode};
 use crate::timefmt::{format_timestamp, is_within};
 
 use super::{NARROW_WIDTH_THRESHOLD, ScreenLayout, compute_layout};
@@ -16,19 +17,124 @@ use super::{NARROW_WIDTH_THRESHOLD, ScreenLayout, compute_layout};
 const MEMBER_ACTIVITY_WINDOW: ChronoDuration = ChronoDuration::hours(1);
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
-    let narrow = frame.area().width < NARROW_WIDTH_THRESHOLD;
-    let layout = compute_layout(frame.area(), app.sidebar_pct, app.focus);
+    // Phase 14E: replay steals one row off the top for the
+    // `▶ REPLAY @ ...` banner; outside replay `body_area` is exactly
+    // `frame.area()`, so this is a no-op for the Off-mode golden regression
+    // (see `render_single`'s doc comment) and every existing split/narrow
+    // snapshot.
+    let full_area = frame.area();
+    let body_area = match &app.replay {
+        Some(replay) if full_area.height > 1 => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
+                .split(full_area);
+            render_replay_banner(frame, replay, rows[0]);
+            rows[1]
+        }
+        _ => full_area,
+    };
+    match &app.split {
+        SplitMode::Off => render_single(frame, app, body_area),
+        SplitMode::Split { active, .. } => render_split(frame, app, *active, body_area),
+    }
+    render_status_line(frame, app, body_area, body_area.width < NARROW_WIDTH_THRESHOLD);
+}
+
+/// `▶ REPLAY @ 2026-07-21 09:00:00 UTC — Esc to exit`, styled so it can't be
+/// mistaken for the regular status line (yellow-on-black rather than the
+/// status line's fg-only colors) — this is the one always-visible cue that
+/// every message/member count on screen is historical, not live.
+fn render_replay_banner(frame: &mut Frame<'_>, replay: &crate::state::ReplayState, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(format!("▶ REPLAY @ {} — Esc to exit", replay.label)).style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        area,
+    );
+}
+
+/// Pre-14A rendering path, unmodified in shape (still the sole path when
+/// `app.split` is `Off`) — this is what the Off-mode golden regression test
+/// pins byte-for-byte. `app.pane_view_active()` is exactly `app`'s own
+/// fields (see `App::swap_active_pane`'s doc comment), so this produces
+/// identical output to reading `app.*` directly, pre-14A.
+fn render_single(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let narrow = area.width < NARROW_WIDTH_THRESHOLD;
+    let layout = compute_layout(area, app.sidebar_pct, app.focus);
+    let pane = app.pane_view_active();
     // In narrow mode `compute_layout` already zeroed out the two panes that
     // aren't `app.focus` (see `compute_narrow_layout`), so these three calls
     // don't need a narrow/wide branch of their own — each just draws into
     // whatever rect it was handed, empty or not.
-    render_teams(frame, app, layout.teams);
-    render_members(frame, app, layout.members);
-    render_room(frame, app, layout.room);
+    render_teams(frame, &pane, layout.teams);
+    render_members(frame, &pane, layout.members);
+    render_room(frame, &pane, layout.room);
     if !narrow {
         render_resize_handle(frame, &layout);
     }
+}
 
+/// Phase 14A: two-pane layout. Side-by-side when the terminal is at least
+/// `SPLIT_WIDE_THRESHOLD` columns wide, stacked (top/bottom) otherwise —
+/// covers the 80x24 reference terminal from the phase constraints. Pane
+/// *slot* (left/top vs. right/bottom) is fixed by `active`: whichever pane
+/// is active is always drawn in the same slot it was in in the previous
+/// frame (see `App::swap_active_pane`), so `Tab` only moves the highlight,
+/// never the panes themselves.
+fn render_split(frame: &mut Frame<'_>, app: &App, active: crate::pane::PaneIdx, area: Rect) {
+    let wide = area.width >= SPLIT_WIDE_THRESHOLD;
+    let direction = if wide {
+        Direction::Horizontal
+    } else {
+        Direction::Vertical
+    };
+    let halves = Layout::default()
+        .direction(direction)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let active_view = app.pane_view_active();
+    let inactive_view = app
+        .pane_view_inactive()
+        .expect("render_split only called while app.split is SplitMode::Split");
+    let (first_view, first_active, second_view, second_active) = match active {
+        crate::pane::PaneIdx::First => (active_view, true, inactive_view, false),
+        crate::pane::PaneIdx::Second => (inactive_view, false, active_view, true),
+    };
+    render_pane(frame, app, &first_view, halves[0], first_active);
+    render_pane(frame, app, &second_view, halves[1], second_active);
+}
+
+/// One split pane: an outer border (highlighted iff `is_active`) wrapping
+/// the same TEAMS/MEMBERS/ROOM trio a single-pane view draws, so both panes
+/// keep the header/body/footer parity the phase spec calls for.
+fn render_pane(frame: &mut Frame<'_>, app: &App, pane: &PaneView<'_>, area: Rect, is_active: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let outer_style = if is_active {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
+    };
+    let outer = Block::default().borders(Borders::ALL).border_style(outer_style);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    // Reuses the single-pane 3-region split (sidebar/teams/members/room) —
+    // its own reserved status row is simply left blank per-pane, since the
+    // real status line is one shared bar under both panes (see `render`).
+    let layout = compute_layout(inner, app.sidebar_pct, pane.focus);
+    render_teams(frame, pane, layout.teams);
+    render_members(frame, pane, layout.members);
+    render_room(frame, pane, layout.room);
+}
+
+fn render_status_line(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
+    let status_area = Rect::new(area.x, area.y + area.height.saturating_sub(1), area.width, 1);
     // The burst banner outranks the regular status line for its 3s window —
     // it's the one alert that must stay visible even if a mark-read or send
     // completes underneath it, so callers don't miss a message flood.
@@ -38,7 +144,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         frame.render_widget(
             Paragraph::new(text.as_str())
                 .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            layout.status,
+            status_area,
         );
         return;
     }
@@ -55,7 +161,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         // truncated it. Trim the message itself rather than let the narrow
         // indicator disappear silently.
         const NARROW_SUFFIX: &str = " [<60cols: 1-pane mode]";
-        let available = (layout.status.width as usize).saturating_sub(NARROW_SUFFIX.chars().count());
+        let available = (status_area.width as usize).saturating_sub(NARROW_SUFFIX.chars().count());
         if status_text.chars().count() > available {
             status_text = status_text
                 .chars()
@@ -74,7 +180,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(status_text).style(status_style),
-        layout.status,
+        status_area,
     );
 }
 
@@ -96,11 +202,16 @@ fn render_resize_handle(frame: &mut Frame<'_>, layout: &ScreenLayout) {
 /// `Focus::Teams` is active in narrow 1-pane mode (S10-3); either way this
 /// function doesn't need to know which, since ratatui widgets no-op on a
 /// zero-size area (the other two panes in narrow mode).
-fn render_teams(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_teams(frame: &mut Frame<'_>, pane: &PaneView<'_>, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let team_items: Vec<ListItem<'_>> = app
+    // Phase 14B: only prefix with `[host]` when at least one remote host is
+    // configured — with zero hosts (the pre-14B / default case) every team
+    // is `LOCAL_HOST` and this branch never fires, so the rendered line is
+    // byte-identical to before 14B (no visual change for existing users).
+    let show_host = pane.teams.iter().any(|team| team.host != crate::db::LOCAL_HOST);
+    let team_items: Vec<ListItem<'_>> = pane
         .teams
         .iter()
         .map(|team| {
@@ -109,11 +220,16 @@ fn render_teams(frame: &mut Frame<'_>, app: &App, area: Rect) {
             } else {
                 String::new()
             };
-            ListItem::new(format!("{}{}", team.name, badge))
+            let host_prefix = if show_host && team.host != crate::db::LOCAL_HOST {
+                format!("[{}] ", team.host)
+            } else {
+                String::new()
+            };
+            ListItem::new(format!("{host_prefix}{}{badge}", team.name))
         })
         .collect();
-    let mut team_state = ListState::default().with_selected(Some(app.selected_team));
-    let team_block = focused_block("TEAMS", app.focus == Focus::Teams);
+    let mut team_state = ListState::default().with_selected(Some(pane.selected_team));
+    let team_block = focused_block("TEAMS", pane.focus == Focus::Teams);
     frame.render_stateful_widget(
         List::new(team_items)
             .block(team_block)
@@ -130,12 +246,12 @@ fn render_teams(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 /// Member list pane — same "draws into whatever `area` it's given" contract
 /// as [`render_teams`].
-fn render_members(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_members(frame: &mut Frame<'_>, pane: &PaneView<'_>, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let now = Utc::now();
-    let member_items: Vec<ListItem<'_>> = app
+    let member_items: Vec<ListItem<'_>> = pane
         .members
         .iter()
         .enumerate()
@@ -154,7 +270,7 @@ fn render_members(frame: &mut Frame<'_>, app: &App, area: Rect) {
             // member 名の右に") rather than every row, so it reads as detail on
             // demand instead of one more always-on badge competing with unread counts.
             let mut suffix = String::new();
-            if index == app.selected_member {
+            if index == pane.selected_member {
                 let active = member
                     .last_message_at
                     .as_deref()
@@ -162,17 +278,17 @@ fn render_members(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 suffix.push(' ');
                 suffix.push(if active { '●' } else { '○' });
             }
-            if app.member_filter.as_deref() == Some(member.name.as_str()) {
+            if pane.member_filter == Some(member.name.as_str()) {
                 suffix.push_str(" [F]");
             }
             ListItem::new(format!("{} {}{}{}", member.name, last, unread, suffix))
         })
         .collect();
-    let selected_member = (!app.members.is_empty()).then_some(app.selected_member);
+    let selected_member = (!pane.members.is_empty()).then_some(pane.selected_member);
     let mut member_state = ListState::default().with_selected(selected_member);
     frame.render_stateful_widget(
         List::new(member_items)
-            .block(focused_block("MEMBERS", app.focus == Focus::Members))
+            .block(focused_block("MEMBERS", pane.focus == Focus::Members))
             .highlight_symbol("> ")
             .highlight_style(
                 Style::default()
@@ -185,40 +301,38 @@ fn render_members(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn render_room(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_room(frame: &mut Frame<'_>, pane: &PaneView<'_>, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let filter_note = app
+    let filter_note = pane
         .member_filter
-        .as_deref()
         .map(|name| format!(" | filter:{name}"))
         .unwrap_or_default();
-    let search_note = app
+    let search_note = pane
         .search_query
-        .as_deref()
         .map(|query| format!(" | /:{query}"))
         .unwrap_or_default();
-    let title = match app.selected_team_name() {
+    let title = match pane.selected_team_name() {
         Some(team) => format!(
             " agmsg-tui | # {team} | {} members | {} unread{filter_note}{search_note} ",
-            app.members.len(),
-            app.total_unread()
+            pane.members.len(),
+            pane.teams.iter().map(|team| team.unread_count).sum::<usize>()
         ),
         None => " agmsg-tui | no teams ".to_owned(),
     };
-    let block = focused_block(&title, app.focus == Focus::Room);
+    let block = focused_block(&title, pane.focus == Focus::Room);
 
     // Member and search filters compose with AND; with neither set this is
     // simply `0..len`, so normal room rendering is unchanged.
-    let visible: Vec<usize> = (0..app.messages.len())
-        .filter(|&index| app.message_matches_filters(&app.messages[index]))
+    let visible: Vec<usize> = (0..pane.messages.len())
+        .filter(|&index| pane.message_matches_filters(&pane.messages[index]))
         .collect();
 
     let mut lines = Vec::new();
     if visible.is_empty() {
         lines.push(Line::from(
-            if app.member_filter.is_some() || app.search_query.is_some() {
+            if pane.member_filter.is_some() || pane.search_query.is_some() {
                 "No messages match the active filter."
             } else {
                 "No messages."
@@ -227,7 +341,7 @@ fn render_room(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         let selected_pos = visible
             .iter()
-            .position(|&index| index == app.selected_message)
+            .position(|&index| index == pane.selected_message)
             .unwrap_or(visible.len() - 1);
         // Each message now spans a header line, a blank separator, and N
         // body lines, so the old "2 lines per message" heuristic no longer
@@ -246,11 +360,11 @@ fn render_room(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
                 )));
             }
-            let message = &app.messages[index];
-            let selected = index == app.selected_message;
-            push_message_header(&mut lines, app, message, selected, now);
+            let message = &pane.messages[index];
+            let selected = index == pane.selected_message;
+            push_message_header(&mut lines, pane, message, selected, now);
             lines.push(Line::from(""));
-            push_message_body(&mut lines, app, message);
+            push_message_body(&mut lines, pane, message);
         }
     }
 
@@ -273,14 +387,14 @@ fn render_room(frame: &mut Frame<'_>, app: &App, area: Rect) {
 /// both the cursor position's neighbor and "not selected" at once.
 fn push_message_header(
     lines: &mut Vec<Line<'static>>,
-    app: &App,
+    pane: &PaneView<'_>,
     message: &crate::db::Message,
     selected: bool,
     now: chrono::DateTime<Utc>,
 ) {
     let lead = if selected {
         "> "
-    } else if app.is_own_message(message) {
+    } else if pane.is_own_message(message) {
         "▏ "
     } else {
         "  "
@@ -319,8 +433,8 @@ fn push_message_header(
 /// Full body when short or already expanded; otherwise the first
 /// `FOLD_PREVIEW_LINES` lines plus a trim note (`X` toggles between the two,
 /// tracked per message id in `App::expanded_messages`).
-fn push_message_body(lines: &mut Vec<Line<'static>>, app: &App, message: &crate::db::Message) {
-    if app.body_is_folded(message) {
+fn push_message_body(lines: &mut Vec<Line<'static>>, pane: &PaneView<'_>, message: &crate::db::Message) {
+    if pane.body_is_folded(message) {
         let (preview, trimmed_chars) = fold_preview(&message.body);
         for line in highlight_body(&preview) {
             lines.push(indent_line(line));

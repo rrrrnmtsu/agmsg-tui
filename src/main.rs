@@ -59,10 +59,39 @@ enum AsyncCommandResult {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.print_default_keys {
+        print!("{}", agmsg_tui::keys::KeyMap::default_toml());
+        return Ok(());
+    }
     let (no_color, palette_mode) = agmsg_tui::config::resolve_palette(&cli);
     agmsg_tui::palette::init(no_color, palette_mode);
     let paths = Paths::from_cli(&cli)?;
+    // Loaded (and any warnings printed) before terminal setup/raw-mode below
+    // so a malformed keys.toml's warning is actually visible to the user
+    // instead of getting swallowed by the alternate screen.
+    let (keymap, key_warnings) = agmsg_tui::keys::KeyMap::load(&paths.keys_file);
+    for warning in &key_warnings {
+        eprintln!("{warning}");
+    }
     let mut app = App::load(paths.clone())?;
+    app.keymap = keymap;
+
+    // Phase 14B: hosts.toml is read the same way as keys.toml (before
+    // raw-mode, warnings to stderr, absent file = silent local-only). Any
+    // snapshot already on disk from a previous run is opened immediately so
+    // a restart doesn't forget the last good remote data while the first
+    // scheduled fetch is still pending.
+    let (hosts_file, host_warnings) = agmsg_tui::remote::HostsFile::load(&paths.hosts_file);
+    for warning in &host_warnings {
+        eprintln!("{warning}");
+    }
+    let host_configs = hosts_file.hosts.clone();
+    let hosts = host_configs
+        .iter()
+        .cloned()
+        .map(|config| agmsg_tui::remote::HostRuntime::from_existing_snapshot(config, &paths.remote_dir))
+        .collect();
+    app.set_hosts(hosts)?;
 
     if cli.diagnose {
         println!(
@@ -106,6 +135,9 @@ async fn main() -> Result<()> {
         &mut terminal,
         &mut app,
         ScriptRunner::new(paths.scripts_dir, paths.audit_script),
+        host_configs,
+        hosts_file.refresh_secs,
+        paths.remote_dir.clone(),
     )
     .await;
     let state_result = app.save_state();
@@ -121,12 +153,16 @@ async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     scripts: ScriptRunner,
+    hosts: Vec<agmsg_tui::remote::HostConfig>,
+    hosts_refresh_secs: u64,
+    remote_dir: std::path::PathBuf,
 ) -> Result<()> {
     let last_seen_id = app.database.last_seen_id()?;
     let mut poller = LivePoller::new(last_seen_id);
     let (audit_tx, mut audit_rx) = unbounded_channel::<Result<CommandResult, String>>();
     let (health_tx, mut health_rx) = unbounded_channel::<Result<HealthSnapshot, String>>();
     let (command_tx, mut command_rx) = unbounded_channel::<AsyncCommandResult>();
+    let (host_tx, mut host_rx) = unbounded_channel::<agmsg_tui::remote::HostFetchOutcome>();
     let mut audit_refresh =
         interval_at(Instant::now() + AUDIT_REFRESH_PERIOD, AUDIT_REFRESH_PERIOD);
     audit_refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -137,6 +173,27 @@ async fn run_tui(
     spinner.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut needs_draw = true;
     let mut notify_sink = NotificationSink::new();
+
+    // Phase 14B: one background fetch loop per configured host, entirely
+    // off the render/input path (invariant #2) — the loop below only ever
+    // drains `host_rx`, mirroring the audit/health task pattern already in
+    // use here. `_host_fetch_handles` just keeps the tasks alive for the
+    // process lifetime; nothing joins them (the process exit tears them
+    // down, same as any other `tokio::spawn`'d background task in main.rs).
+    let ssh_fetcher: std::sync::Arc<dyn agmsg_tui::remote::SnapshotFetcher + Send + Sync> =
+        std::sync::Arc::new(agmsg_tui::remote::SshFetcher);
+    let _host_fetch_handles: Vec<_> = hosts
+        .into_iter()
+        .map(|host| {
+            agmsg_tui::remote::spawn_fetch_loop(
+                ssh_fetcher.clone(),
+                host,
+                hosts_refresh_secs,
+                remote_dir.clone(),
+                host_tx.clone(),
+            )
+        })
+        .collect();
 
     loop {
         if needs_draw {
@@ -164,6 +221,13 @@ async fn run_tui(
             match result {
                 Ok(snapshot) => app.complete_health(snapshot),
                 Err(error) => app.complete_health_error(error),
+            }
+            needs_draw = true;
+        }
+
+        while let Ok(outcome) = host_rx.try_recv() {
+            if let Err(error) = app.complete_host_fetch(outcome) {
+                app.set_error(&error);
             }
             needs_draw = true;
         }
@@ -224,6 +288,13 @@ async fn run_tui(
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => {
+                    // Phase 14A: keep `app.term_area` current so the split-
+                    // entry min-height guard (`Ctrl+S`) sees the real
+                    // terminal size even when the last event was a key, not
+                    // a mouse move/click (which is `handle_mouse`'s own
+                    // update path).
+                    let size = terminal.size()?;
+                    app.term_area = Rect::new(0, 0, size.width, size.height);
                     let action = app.handle_key(key)?;
                     if matches!(action, AppAction::Quit) {
                         return Ok(());

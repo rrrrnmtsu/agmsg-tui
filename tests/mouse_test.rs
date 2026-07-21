@@ -42,6 +42,9 @@ fn fixture_app() -> (TempDir, App) {
         audit_history: temp.path().join("audit.jsonl"),
         report_dir: temp.path().join("reports"),
         state_file: temp.path().join("state.json"),
+        keys_file: temp.path().join("keys.toml"),
+        hosts_file: temp.path().join("hosts.toml"),
+        remote_dir: temp.path().join("agmsg-remote"),
     })
     .expect("app");
     (temp, app)

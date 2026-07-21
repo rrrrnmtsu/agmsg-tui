@@ -11,6 +11,35 @@ use crate::ui::SIDEBAR_DEFAULT_PCT;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 
+/// Phase 14E: frozen viewpoint entered from the Audit HISTORY tab's `r` key.
+/// While `App.replay` is `Some`, every Main-view message/member query filters
+/// to `created_at <= snapshot_ts` (see `App::data_as_of`) and the live poller
+/// stops pushing new rows in (see `App::receive_new_messages`).
+///
+/// Deliberately **not** part of `PersistentState` — a frozen historical view
+/// is a transient debugging session, not a preference to restore on the next
+/// launch (unlike `sidebar_pct`/`last_team`/drafts, which describe how the
+/// user likes the live app arranged).
+///
+/// Deviation from the phase-14 plan doc: the doc's sketch used
+/// `snapshot_ts: i64`, written against an assumed epoch column. The actual
+/// `messages.created_at` column (verified in `db.rs`) is `TEXT` holding
+/// `%Y-%m-%dT%H:%M:%SZ` RFC3339 — the same format `audit_history.rs` parses
+/// `AuditHistorySample.timestamp` from. Comparing that text lexically
+/// (`created_at <= ?`) is exact for this fixed-width, zero-padded, UTC-only
+/// format, so a `String` here avoids an epoch round-trip that the schema
+/// doesn't otherwise need.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayState {
+    /// RFC3339 UTC, formatted to match `messages.created_at` exactly.
+    pub snapshot_ts: String,
+    /// Pre-formatted for the header banner (`▶ REPLAY @ <label>`).
+    pub label: String,
+    /// `true` when `Esc` should land back on Audit/History (entered via the
+    /// `r` key there) rather than stay on Main.
+    pub return_to_audit: bool,
+}
+
 /// ユーザー操作で変わる表示状態だけを保存する。DB/config の write path とは分離する。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistentState {

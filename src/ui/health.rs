@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
 
 use crate::app::App;
 use crate::health::{BridgeStatus, HealthSnapshot};
+use crate::launchagent::{LaState, LaunchAgentStatus};
 
 use super::NARROW_WIDTH_THRESHOLD;
 
@@ -31,7 +32,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     ]);
     let block = Block::default()
         .title(title)
-        .title_bottom(" H/Esc:back  j/k:team  t:7d/30d  R:refresh  ?:help ")
+        .title_bottom(" H/Esc:back  j/k:team  t:7d/30d  R:refresh  L:toggle-agent  ?:help ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(frame.area());
@@ -56,6 +57,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             Constraint::Min(5),
             Constraint::Length(1),
             Constraint::Length(4),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(inner);
     let narrow = frame.area().width < NARROW_WIDTH_THRESHOLD;
@@ -64,6 +67,46 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     render_agents(frame, app, rows[2]);
     render_separator(frame, rows[3]);
     render_daily_total(frame, app, snapshot, rows[4]);
+    render_separator(frame, rows[5]);
+    render_automation(frame, app, rows[6]);
+}
+
+/// Phase 14D: single-row "Automation" section for the
+/// `com.remma.agmsg-audit-daily` LaunchAgent — label, loaded/unloaded state,
+/// and next scheduled run.
+fn render_automation(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let text = match app.launchagent.as_ref() {
+        None => Line::from(Span::styled(
+            "Automation: loading...",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Some(status) => automation_line(status),
+    };
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+fn automation_line(status: &LaunchAgentStatus) -> Line<'static> {
+    match &status.state {
+        LaState::Loaded { .. } => Line::from(vec![
+            Span::styled("● ", Style::default().fg(Color::Green)),
+            Span::raw(format!("{}  loaded  next: {}", status.label, status.next_run_label())),
+        ]),
+        LaState::Unloaded => Line::from(vec![
+            Span::styled("○ ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{}  unloaded  [L] to load", status.label)),
+        ]),
+        LaState::Missing => Line::from(vec![
+            Span::styled("– ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}  plist missing", status.label),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        LaState::Unsupported => Line::from(Span::styled(
+            "– LaunchAgent control: unsupported on this OS",
+            Style::default().fg(Color::DarkGray),
+        )),
+    }
 }
 
 fn window_span(days: u32, selected: u32) -> Span<'static> {
@@ -445,8 +488,9 @@ fn format_age(age: Option<Duration>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::bridge_marker;
+    use super::{automation_line, bridge_marker};
     use crate::health::BridgeStatus;
+    use crate::launchagent::{LaState, LaunchAgentStatus};
 
     fn bridge(pid: u32, alive: bool) -> BridgeStatus {
         BridgeStatus {
@@ -462,5 +506,35 @@ mod tests {
         assert_eq!(bridge_marker(&[bridge(1, true), bridge(2, true)]), "●");
         assert_eq!(bridge_marker(&[bridge(1, true), bridge(2, false)]), "◐");
         assert_eq!(bridge_marker(&[bridge(1, false), bridge(2, false)]), "○");
+    }
+
+    fn status(state: LaState) -> LaunchAgentStatus {
+        LaunchAgentStatus {
+            label: "com.remma.agmsg-audit-daily".to_owned(),
+            plist: None,
+            state,
+            next_run: None,
+        }
+    }
+
+    /// Phase 14D — row text for the Automation section's 4 states (stands
+    /// in for a full TestBackend snapshot, which lives in `ui/mod.rs`,
+    /// outside this phase's file scope).
+    #[test]
+    fn automation_line_covers_loaded_unloaded_missing_unsupported_variants() {
+        let loaded = automation_line(&status(LaState::Loaded { pid: Some(123) }))
+            .to_string();
+        assert!(loaded.contains("loaded"));
+        assert!(loaded.contains("com.remma.agmsg-audit-daily"));
+
+        let unloaded = automation_line(&status(LaState::Unloaded)).to_string();
+        assert!(unloaded.contains("unloaded"));
+        assert!(unloaded.contains("[L] to load"));
+
+        let missing = automation_line(&status(LaState::Missing)).to_string();
+        assert!(missing.contains("plist missing"));
+
+        let unsupported = automation_line(&status(LaState::Unsupported)).to_string();
+        assert!(unsupported.contains("unsupported on this OS"));
     }
 }

@@ -49,10 +49,23 @@ pub struct Message {
     pub read_at: Option<String>,
 }
 
+/// Reserved `host` value for teams backed by the local `~/.agents/agmsg.db`
+/// connection. Mirrors `crate::remote::LOCAL_HOST_ID` — duplicated here
+/// (rather than importing `remote`) so `db.rs` stays unaware of the hosts
+/// concept beyond this one tag; `remote.rs` is the source of truth for the
+/// value and a test below pins them equal.
+pub const LOCAL_HOST: &str = "local";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TeamSummary {
     pub name: String,
     pub unread_count: usize,
+    /// `LOCAL_HOST` for teams from the local DB, or a `hosts.toml` host
+    /// name for teams sourced from a remote snapshot (Phase 14B). Reads use
+    /// this to route member/message queries at the app layer; the union
+    /// itself happens in Rust (App merges `Vec<TeamSummary>` per host), not
+    /// via cross-database SQL.
+    pub host: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,12 +235,24 @@ impl Database {
     }
 
     pub fn team_summaries(&self, teams_dir: &Path) -> Result<Vec<TeamSummary>> {
+        self.team_summaries_for_host(teams_dir, LOCAL_HOST)
+    }
+
+    /// Same as `team_summaries` but tags every row with `host` instead of
+    /// `LOCAL_HOST` — used by the app layer to load a remote snapshot's team
+    /// list (Phase 14B). `teams_dir` should be a non-existent path for
+    /// remote hosts (see `crate::remote::empty_teams_dir`) since there's no
+    /// local roster mirror for them; `team_names` already degrades cleanly
+    /// to the DB-only `SELECT DISTINCT team` query when the directory is
+    /// absent.
+    pub fn team_summaries_for_host(&self, teams_dir: &Path, host: &str) -> Result<Vec<TeamSummary>> {
         let unread = self.unread_counts()?;
         Ok(self
             .team_names(teams_dir)?
             .into_iter()
             .map(|name| TeamSummary {
                 unread_count: unread.get(&name).copied().unwrap_or_default(),
+                host: host.to_owned(),
                 name,
             })
             .collect())
@@ -449,19 +474,43 @@ impl Database {
     }
 
     pub fn member_summaries(&self, teams_dir: &Path, team: &str) -> Result<Vec<MemberSummary>> {
+        self.member_summaries_as_of(teams_dir, team, None)
+    }
+
+    /// Phase 14E: same query `member_summaries` runs, plus an optional
+    /// `created_at <= as_of` / `read_at > as_of` cutoff for replay mode.
+    /// `member_summaries` is a thin `as_of: None` wrapper around this so the
+    /// live and replay paths never drift into two copies of the SQL.
+    ///
+    /// Why the unread half also checks `read_at > as_of` and not just
+    /// `read_at IS NULL`: a message can have been marked read *after* the
+    /// snapshot moment, in which case it was still unread as of `as_of` and
+    /// replay should show it that way — matching "member last-seen derived
+    /// only from those rows" from the phase spec's test plan.
+    pub fn member_summaries_as_of(
+        &self,
+        teams_dir: &Path,
+        team: &str,
+        as_of: Option<&str>,
+    ) -> Result<Vec<MemberSummary>> {
         let roster = Self::load_roster(teams_dir, team)?;
         let connection = self.connect()?;
         let mut statement = connection.prepare(
             "SELECT MAX(created_at),
-                    COALESCE(SUM(CASE WHEN to_agent = ?2 AND read_at IS NULL THEN 1 ELSE 0 END), 0)
+                    COALESCE(SUM(CASE WHEN to_agent = ?2
+                                       AND (read_at IS NULL OR (?3 IS NOT NULL AND read_at > ?3))
+                                      THEN 1 ELSE 0 END), 0)
              FROM messages
-             WHERE team = ?1 AND (from_agent = ?2 OR to_agent = ?2)",
+             WHERE team = ?1 AND (from_agent = ?2 OR to_agent = ?2)
+               AND (?3 IS NULL OR created_at <= ?3)",
         )?;
         roster
             .into_iter()
             .map(|name| {
                 let (last_message_at, unread_count): (Option<String>, i64) = statement
-                    .query_row(params![team, name], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                    .query_row(params![team, name, as_of], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?;
                 Ok(MemberSummary {
                     name,
                     last_message_at,
@@ -472,6 +521,20 @@ impl Database {
     }
 
     pub fn history(&self, team: &str, before_id: Option<i64>, limit: usize) -> Result<HistoryPage> {
+        self.history_as_of(team, before_id, limit, None)
+    }
+
+    /// Phase 14E: same query `history` runs, plus an optional
+    /// `created_at <= as_of` cutoff for replay mode. `history` is a thin
+    /// `as_of: None` wrapper around this so the live and replay paths never
+    /// drift into two copies of the SQL.
+    pub fn history_as_of(
+        &self,
+        team: &str,
+        before_id: Option<i64>,
+        limit: usize,
+        as_of: Option<&str>,
+    ) -> Result<HistoryPage> {
         let fetch_limit =
             i64::try_from(limit.saturating_add(1)).context("履歴件数が大きすぎます")?;
         let connection = self.connect()?;
@@ -486,11 +549,12 @@ impl Database {
                     OR created_at < (SELECT created_at FROM cursor)
                     OR (created_at = (SELECT created_at FROM cursor)
                         AND id < (SELECT id FROM cursor)))
+               AND (?4 IS NULL OR created_at <= ?4)
              ORDER BY created_at DESC, id DESC
              LIMIT ?3",
         )?;
         let mut messages = statement
-            .query_map(params![team, before_id, fetch_limit], map_message)?
+            .query_map(params![team, before_id, fetch_limit, as_of], map_message)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let has_more = messages.len() > limit;
         messages.truncate(limit);
@@ -920,6 +984,74 @@ pub fn silent_identity_days() -> u32 {
         .and_then(|value| value.parse().ok())
         .filter(|days| *days > 0)
         .unwrap_or(SILENT_IDENTITY_DAYS)
+}
+
+/// Phase 14B: Rust-level union of a local + N remote `Database`s' team
+/// lists, each tagged with its host. No cross-database SQL — each
+/// `team_summaries_for_host` call only ever touches its own connection.
+#[cfg(test)]
+mod multi_host_tests {
+    use rusqlite::Connection;
+
+    use super::{Database, LOCAL_HOST};
+
+    fn fixture(team: &str) -> (tempfile::TempDir, Database) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("messages.db");
+        let connection = Connection::open(&path).expect("fixture db");
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team TEXT NOT NULL,
+                    from_agent TEXT NOT NULL,
+                    to_agent TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    read_at TEXT
+                );
+                INSERT INTO messages (team, from_agent, to_agent, body, created_at)
+                VALUES ('{team}', 'claude', 'codex', 'hi', '2026-07-20T00:00:00Z');"
+            ))
+            .expect("fixture schema+row");
+        (temp, Database::new(path))
+    }
+
+    #[test]
+    fn union_of_local_and_remote_team_lists_carries_correct_host() {
+        let (_local_temp, local) = fixture("ops-hub");
+        let (_remote_temp, remote) = fixture("vps-ops");
+        let empty_dir = std::path::PathBuf::from("/nonexistent/agmsg-tui-test-teams-dir");
+
+        let mut teams = local.team_summaries(&empty_dir).expect("local teams");
+        teams.extend(
+            remote
+                .team_summaries_for_host(&empty_dir, "vps")
+                .expect("remote teams"),
+        );
+
+        assert_eq!(teams.len(), 2);
+        let local_row = teams.iter().find(|team| team.name == "ops-hub").expect("local row");
+        assert_eq!(local_row.host, LOCAL_HOST);
+        let remote_row = teams.iter().find(|team| team.name == "vps-ops").expect("remote row");
+        assert_eq!(remote_row.host, "vps");
+    }
+
+    #[test]
+    fn corrupt_remote_db_query_errors_without_touching_local_result() {
+        let (_local_temp, local) = fixture("ops-hub");
+        let empty_dir = std::path::PathBuf::from("/nonexistent/agmsg-tui-test-teams-dir");
+        let local_teams = local.team_summaries(&empty_dir).expect("local teams");
+        assert_eq!(local_teams.len(), 1);
+
+        let corrupt_dir = tempfile::tempdir().expect("tempdir");
+        let corrupt_path = corrupt_dir.path().join("corrupt.db");
+        std::fs::write(&corrupt_path, b"not a sqlite database").expect("write garbage");
+        let corrupt = Database::new(corrupt_path);
+        assert!(corrupt.team_summaries_for_host(&empty_dir, "vps").is_err());
+        // local result stands untouched regardless of the remote error.
+        assert_eq!(local_teams.len(), 1);
+    }
 }
 
 #[cfg(test)]
